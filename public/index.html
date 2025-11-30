@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aurora Browser</title>
+  <link rel="stylesheet" href="browser.css">
+  <link rel="shortcut icon" href="favicon.ico">
+  <script src="/scram/scramjet.all.js"></script>
+  <script src="baremux/index.js" defer></script>
+  <script src="epoxy/index.js" defer></script>
+  <script src="register-sw.js" defer></script>
+  <script src="browser.js" defer></script>
+</head>
+<body>
+  <!-- Browser Chrome UI -->
+  <div class="browser-container">
+    <!-- Title Bar -->
+    <div class="title-bar">
+      <div class="window-controls">
+        <span class="window-btn close"></span>
+        <span class="window-btn minimize"></span>
+        <span class="window-btn maximize"></span>
+      </div>
+      <div class="title-text">Aurora Browser</div>
+      <div class="menu-bar">
+        <button id="menu-btn" class="menu-btn" title="Menu">☰</button>
+      </div>
+    </div>
+
+    <!-- Tab Bar -->
+    <div class="tab-bar">
+      <div class="tabs" id="tabs-container">
+        <!-- Tabs go here -->
+      </div>
+      <!-- New tab button moved inside tabs-container via JS -->
+    </div>
+
+    <!-- Navigation Bar -->
+    <div class="nav-bar">
+      <div class="nav-buttons">
+        <button id="back-btn" class="nav-btn" title="Back (Alt+←)" disabled>←</button>
+        <button id="forward-btn" class="nav-btn" title="Forward (Alt+→)" disabled>→</button>
+        <button id="refresh-btn" class="nav-btn" title="Refresh (F5)">↻</button>
+        <button id="home-btn" class="nav-btn" title="Home">🏠</button>
+      </div>
+      <div class="url-bar-container">
+        <span class="url-protocol" id="url-protocol">aurora://</span>
+        <input type="text" id="url-bar" class="url-bar" placeholder="Search or enter URL" autocomplete="off">
+        <button id="go-btn" class="go-btn" title="Go">→</button>
+      </div>
+      <div class="toolbar-buttons">
+        <div id="extensions-toolbar"></div>
+        <button id="bookmark-btn" class="toolbar-btn" title="Bookmark this page">☆</button>
+        <button id="devtools-btn" class="toolbar-btn" title="DevTools (F12)">⚙</button>
+        <button id="settings-btn" class="toolbar-btn" title="Settings">⋮</button>
+      </div>
+    </div>
+
+    <!-- Bookmarks Bar -->
+    <div class="bookmarks-bar" id="bookmarks-bar">
+      <span class="bookmarks-label">Bookmarks:</span>
+      <div class="bookmarks-list" id="bookmarks-list">
+        <!-- Bookmarks will be added dynamically -->
+      </div>
+    </div>
+
+    <!-- Main Content Area -->
+    <div class="main-content" id="main-content">
+      <!-- Browser Frame Container -->
+      <div class="browser-frame-container" id="browser-frame-container">
+        <!-- Frames will be added dynamically for each tab -->
+      </div>
+
+      <!-- Home Page -->
+      <div class="home-page" id="home-page">
+        <div class="home-logo">
+          <div class="aurora-logo">🌌</div>
+          <h1>Aurora Browser</h1>
+        </div>
+        <div class="search-container">
+          <input type="text" id="home-search" class="home-search" placeholder="Search or enter URL">
+          <button id="home-search-btn" class="home-search-btn">Search</button>
+        </div>
+        <div class="quick-links">
+          <h3>Quick Links</h3>
+          <div class="quick-links-grid">
+            <a href="#" class="quick-link" data-url="aurora://chat">
+              <span class="quick-link-icon">💬</span>
+              <span class="quick-link-text">Chat</span>
+            </a>
+            <a href="#" class="quick-link" data-url="aurora://post">
+              <span class="quick-link-icon">📝</span>
+              <span class="quick-link-text">Post</span>
+            </a>
+            <a href="#" class="quick-link" data-url="aurora://bookmarks">
+              <span class="quick-link-icon">⭐</span>
+              <span class="quick-link-text">Bookmarks</span>
+            </a>
+            <a href="#" class="quick-link" data-url="aurora://history">
+              <span class="quick-link-icon">🕒</span>
+              <span class="quick-link-text">History</span>
+            </a>
+            <a href="#" class="quick-link" data-url="aurora://settings">
+              <span class="quick-link-icon">⚙️</span>
+              <span class="quick-link-text">Settings</span>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings Page -->
+      <div class="settings-page hidden" id="settings-page">
+        <div class="settings-container">
+          <h1>⚙️ Settings</h1>
+          
+          <section class="settings-section">
+            <h2>Search Engine</h2>
+            <div class="setting-group">
+              <label for="search-engine">Default Search Engine:</label>
+              <select id="search-engine">
+                <option value="https://www.google.com/search?q=%s">Google</option>
+                <option value="https://duckduckgo.com/?q=%s">DuckDuckGo</option>
+                <option value="https://www.bing.com/search?q=%s">Bing</option>
+                <option value="https://search.yahoo.com/search?p=%s">Yahoo</option>
+              </select>
+            </div>
+          </section>
+          
+          <section class="settings-section">
+            <h2>Appearance</h2>
+            <div class="setting-group">
+              <label for="theme">Theme:</label>
+              <select id="theme">
+                <option value="dark">Dark</option>
+                <option value="light">Light</option>
+                <option value="midnight">Midnight</option>
+                <option value="ocean">Ocean</option>
+                <option value="forest">Forest</option>
+              </select>
+            </div>
+            <div class="setting-group">
+              <label>
+                <input type="checkbox" id="show-bookmarks-bar" checked>
+                Show Bookmarks Bar
+              </label>
+            </div>
+          </section>
+          
+          <section class="settings-section">
+            <h2>Data Management</h2>
+            <button id="clear-history" class="settings-btn danger">Clear History</button>
+            <button id="clear-bookmarks" class="settings-btn danger">Clear Bookmarks</button>
+            <button id="reset-settings" class="settings-btn danger">Reset All Settings</button>
+          </section>
+          
+          <section class="settings-section">
+            <h2>Keyboard Shortcuts</h2>
+            <div class="shortcuts-list">
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>T</kbd> New Tab</div>
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>W</kbd> Close Tab</div>
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>L</kbd> Focus URL Bar</div>
+              <div class="shortcut"><kbd>Alt</kbd> + <kbd>←</kbd> Back</div>
+              <div class="shortcut"><kbd>Alt</kbd> + <kbd>→</kbd> Forward</div>
+              <div class="shortcut"><kbd>F5</kbd> Refresh</div>
+              <div class="shortcut"><kbd>F12</kbd> DevTools</div>
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>D</kbd> Bookmark Page</div>
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>H</kbd> History</div>
+              <div class="shortcut"><kbd>Ctrl</kbd> + <kbd>B</kbd> Bookmarks</div>
+            </div>
+          </section>
+          
+          <section class="settings-section">
+            <h2>About Aurora</h2>
+            <p>Aurora Browser v1.0.0</p>
+            <p>A sophisticated web proxy browser built on Scramjet technology.</p>
+            <p style="margin-top: 10px; font-size: 12px; color: var(--text-secondary);">Copyright 2025 Firewall Freedom by Sirco</p>
+          </section>
+        </div>
+      </div>
+
+      <!-- Extensions Page -->
+      <div class="extensions-page hidden" id="extensions-page">
+        <div class="settings-container">
+          <h1>🧩 Extensions</h1>
+          
+          <div class="settings-section">
+            <h3>Install Extension</h3>
+            <p style="color: var(--text-secondary); margin-bottom: 10px;">Paste the extension code (including METADATA) below:</p>
+            <textarea id="extension-code-input" class="settings-input" style="width: 100%; height: 150px; font-family: monospace; margin-bottom: 10px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 10px; border-radius: 4px;" placeholder="/*METADATA*/ ..."></textarea>
+            <button id="install-code-btn" class="settings-btn primary">Install Extension</button>
+          </div>
+
+          <div class="settings-section">
+            <h3>Installed Extensions</h3>
+            <div id="extensions-list" style="margin-top: 20px; display: flex; flex-direction: column; gap: 10px;">
+              <!-- Extensions list -->
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- History Page -->
+      <div class="history-page hidden" id="history-page">
+        <div class="history-container">
+          <h1>🕒 History</h1>
+          <button id="clear-all-history" class="settings-btn danger">Clear All History</button>
+          <div class="history-list" id="history-list">
+            <!-- History items will be added dynamically -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Bookmarks Page -->
+      <div class="bookmarks-page hidden" id="bookmarks-page">
+        <div class="bookmarks-container">
+          <h1>⭐ Bookmarks</h1>
+          <div class="bookmarks-full-list" id="bookmarks-full-list">
+            <!-- Bookmark items will be added dynamically -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DevTools Panel -->
+    <div class="devtools-panel hidden" id="devtools-panel">
+      <div class="devtools-header">
+        <div class="devtools-tabs">
+          <button class="devtools-tab active" data-panel="elements">Elements</button>
+          <button class="devtools-tab" data-panel="console">Console</button>
+          <button class="devtools-tab" data-panel="network">Network</button>
+          <button class="devtools-tab" data-panel="sources">Sources</button>
+          <button class="devtools-tab" data-panel="application">Application</button>
+        </div>
+        <button id="close-devtools" class="close-devtools">×</button>
+      </div>
+      <div class="devtools-content">
+        <div class="devtools-pane active" id="devtools-elements">
+          <div class="elements-tree" id="elements-tree">
+            <p class="devtools-info">Select an element in the page to inspect it.</p>
+            <div id="dom-tree"></div>
+          </div>
+          <div class="elements-styles">
+            <h4>Styles</h4>
+            <div id="element-styles"></div>
+          </div>
+        </div>
+        <div class="devtools-pane" id="devtools-console">
+          <div class="console-output" id="console-output">
+            <!-- Console messages will be added here -->
+          </div>
+          <div class="console-input-container">
+            <span class="console-prompt">&gt;</span>
+            <input type="text" id="console-input" class="console-input" placeholder="Type JavaScript here...">
+          </div>
+        </div>
+        <div class="devtools-pane" id="devtools-network">
+          <div class="network-toolbar">
+            <button id="clear-network" class="devtools-btn">Clear</button>
+            <label><input type="checkbox" id="preserve-log"> Preserve log</label>
+          </div>
+          <div class="network-list-header">
+            <span class="network-col">Name</span>
+            <span class="network-col">Status</span>
+            <span class="network-col">Type</span>
+            <span class="network-col">Size</span>
+            <span class="network-col">Time</span>
+          </div>
+          <div class="network-list" id="network-list">
+            <!-- Network requests will be added here -->
+          </div>
+        </div>
+        <div class="devtools-pane" id="devtools-sources">
+          <div class="sources-sidebar">
+            <h4>Page Sources</h4>
+            <div id="sources-list"></div>
+          </div>
+          <div class="sources-content">
+            <pre id="source-code"></pre>
+          </div>
+        </div>
+        <div class="devtools-pane" id="devtools-application">
+          <div class="application-sidebar">
+            <h4>Storage</h4>
+            <ul>
+              <li class="app-item" data-type="localStorage">Local Storage</li>
+              <li class="app-item" data-type="sessionStorage">Session Storage</li>
+              <li class="app-item" data-type="cookies">Cookies</li>
+            </ul>
+          </div>
+          <div class="application-content" id="application-content">
+            <p class="devtools-info">Select a storage type to view its contents.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context Menu -->
+  <div class="context-menu hidden" id="context-menu">
+    <div class="context-menu-item" data-action="back">← Back</div>
+    <div class="context-menu-item" data-action="forward">→ Forward</div>
+    <div class="context-menu-item" data-action="refresh">↻ Refresh</div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="view-source">View Page Source</div>
+    <div class="context-menu-item" data-action="inspect">Inspect Element</div>
+  </div>
+
+  <!-- Main Menu Dropdown -->
+  <div class="main-menu hidden" id="main-menu">
+    <div class="menu-item" data-action="new-tab">New Tab <span class="shortcut">Ctrl+T</span></div>
+    <div class="menu-item" data-action="new-window">New Window</div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="history">History <span class="shortcut">Ctrl+H</span></div>
+    <div class="menu-item" data-action="bookmarks">Bookmarks <span class="shortcut">Ctrl+B</span></div>
+    <div class="menu-item" data-action="extensions">Extensions</div>
+    <div class="menu-item" data-action="downloads">Downloads</div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="zoom-in">Zoom In <span class="shortcut">Ctrl++</span></div>
+    <div class="menu-item" data-action="zoom-out">Zoom Out <span class="shortcut">Ctrl+-</span></div>
+    <div class="menu-item" data-action="zoom-reset">Reset Zoom <span class="shortcut">Ctrl+0</span></div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="find">Find in Page <span class="shortcut">Ctrl+F</span></div>
+    <div class="menu-item" data-action="print">Print <span class="shortcut">Ctrl+P</span></div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="devtools">Developer Tools <span class="shortcut">F12</span></div>
+    <div class="menu-item" data-action="settings">Settings</div>
+    <div class="menu-separator"></div>
+    <div class="menu-item" data-action="about">About Aurora</div>
+  </div>
+
+  <!-- Bookmark Add Dialog -->
+  <div class="dialog-overlay hidden" id="bookmark-dialog-overlay">
+    <div class="dialog" id="bookmark-dialog">
+      <h3>Add Bookmark</h3>
+      <div class="dialog-content">
+        <label for="bookmark-name">Name:</label>
+        <input type="text" id="bookmark-name" class="dialog-input">
+        <label for="bookmark-url">URL:</label>
+        <input type="text" id="bookmark-url" class="dialog-input">
+      </div>
+      <div class="dialog-buttons">
+        <button id="bookmark-cancel" class="dialog-btn">Cancel</button>
+        <button id="bookmark-save" class="dialog-btn primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Extension Install Dialog -->
+  <div class="dialog-overlay hidden" id="extension-dialog-overlay">
+    <div class="dialog">
+      <h3>Install Extension</h3>
+      <div class="dialog-content">
+        <label for="extension-url-input">Extension URL:</label>
+        <input type="text" id="extension-url-input" class="dialog-input" placeholder="e.g., /ad.txt or https://...">
+      </div>
+      <div class="dialog-buttons">
+        <button id="extension-cancel" class="dialog-btn">Cancel</button>
+        <button id="extension-install" class="dialog-btn primary">Install</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

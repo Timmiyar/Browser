@@ -1,0 +1,392 @@
+/*METADATA*/
+{
+    "id": "aurora-adblock",
+    "name": "Aurora AdBlock Pro",
+    "description": "Advanced ad blocker with custom filter lists and rule management.",
+    "version": "2.1.0",
+    "icon": "🛡️"
+}
+/*CODE*/
+(function() {
+    const DEFAULT_LISTS = [
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/easylist.txt", title: "EasyList" },
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/abp-filters-anti-cv.txt", title: "ABP Anti-CV" },
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/easyprivacy.txt", title: "EasyPrivacy" },
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/fanboy-notifications.txt", title: "Fanboy Notifications" },
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/fanboy-social.txt", title: "Fanboy Social" },
+        { url: "https://easylist-downloads.adblockplus.org/v3/full/distraction-control-free.txt", title: "Distraction Control" }
+    ];
+
+    const STORAGE_KEY = 'aurora_adblock_config';
+
+    class AdBlocker {
+        constructor() {
+            this.state = {
+                enabled: true,
+                blockedCount: 0,
+                customRules: "",
+                lists: JSON.parse(JSON.stringify(DEFAULT_LISTS)).map(l => ({...l, enabled: true, lastUpdated: 0, rules: []}))
+            };
+            
+            this.blockedDomains = new Set();
+            this.cssRules = [];
+            
+            this.loadState();
+            this.rebuildRules();
+            this.init();
+        }
+
+        loadState() {
+            try {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    this.state.enabled = parsed.enabled;
+                    this.state.blockedCount = parsed.blockedCount || 0;
+                    this.state.customRules = parsed.customRules || "";
+                    if (parsed.lists && parsed.lists.length > 0) {
+                        this.state.lists = parsed.lists;
+                    }
+                }
+            } catch (e) {
+                console.error("AdBlock: Failed to load state", e);
+            }
+        }
+
+        saveState() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+            } catch (e) {
+                console.error("AdBlock: Failed to save state", e);
+            }
+        }
+
+        rebuildRules() {
+            this.blockedDomains.clear();
+            this.cssRules = [];
+            
+            const processRule = (line) => {
+                if (!line || line.startsWith('!')) return;
+                
+                // Element hiding
+                if (line.includes('##')) {
+                    const parts = line.split('##');
+                    if (parts[1]) this.cssRules.push(parts[1]);
+                    return;
+                }
+                
+                // Domain blocking (simplified)
+                if (line.startsWith('||')) {
+                    let domain = line.substring(2);
+                    const endChars = ['^', '/'];
+                    endChars.forEach(c => {
+                        if (domain.includes(c)) domain = domain.split(c)[0];
+                    });
+                    this.blockedDomains.add(domain);
+                }
+            };
+
+            this.state.lists.forEach(list => {
+                if (list.enabled && list.rules) {
+                    list.rules.forEach(processRule);
+                }
+            });
+            
+            if (this.state.customRules) {
+                this.state.customRules.split('\n').forEach(line => processRule(line.trim()));
+            }
+        }
+
+        init() {
+            this.createPopup();
+            this.addButton();
+            
+            if (window.aurora) {
+                window.aurora.onBeforeNavigate((url) => {
+                    if (!this.state.enabled) return;
+                    try {
+                        const urlObj = new URL(url);
+                        const hostname = urlObj.hostname;
+                        for (const domain of this.blockedDomains) {
+                            if (hostname === domain || hostname.endsWith('.' + domain)) {
+                                this.state.blockedCount++;
+                                this.updateCountUI();
+                                this.saveState();
+                                return { cancel: true };
+                            }
+                        }
+                    } catch (e) {}
+                });
+                
+                window.aurora.onTabLoaded((tabId) => {
+                    if (!this.state.enabled || this.cssRules.length === 0) return;
+                    // Chunk CSS to avoid huge style tags
+                    const chunkSize = 2000;
+                    for (let i = 0; i < this.cssRules.length; i += chunkSize) {
+                        const chunk = this.cssRules.slice(i, i + chunkSize);
+                        const css = chunk.join(', ') + ' { display: none !important; }';
+                        window.aurora.injectCSS(tabId, css);
+                    }
+                });
+            }
+        }
+
+        addButton() {
+            if (document.getElementById('adblock-btn')) return;
+            const btn = document.createElement('button');
+            btn.className = 'toolbar-btn';
+            btn.id = 'adblock-btn';
+            btn.innerHTML = '🛡️';
+            btn.title = 'Aurora AdBlock';
+            btn.onclick = (e) => {
+                e.stopPropagation();
+                this.togglePopup();
+            };
+            const container = document.getElementById('extensions-toolbar');
+            if (container) container.appendChild(btn);
+        }
+
+        createPopup() {
+            if (document.getElementById('adblock-popup')) return;
+
+            const popup = document.createElement('div');
+            popup.id = 'adblock-popup';
+            popup.className = 'extension-popup hidden';
+            
+            const style = document.createElement('style');
+            style.textContent = `
+                #adblock-popup { width: 320px; font-family: system-ui, sans-serif; background: var(--bg-secondary, #222); color: var(--text-primary, #fff); border: 1px solid var(--border-color, #444); border-radius: 8px; padding: 0; overflow: hidden; display: flex; flex-direction: column; max-height: 500px; z-index: 10000; position: fixed; }
+                .ab-header { padding: 12px; background: var(--bg-tertiary, #333); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; }
+                .ab-content { padding: 12px; overflow-y: auto; flex: 1; }
+                .ab-footer { padding: 8px; background: var(--bg-tertiary, #333); border-top: 1px solid #444; display: flex; justify-content: space-between; }
+                .ab-tab-btn { background: none; border: none; color: #aaa; cursor: pointer; padding: 4px 8px; font-size: 12px; }
+                .ab-tab-btn.active { color: #fff; font-weight: bold; border-bottom: 2px solid #007acc; }
+                .ab-list-item { margin-bottom: 8px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; }
+                .ab-list-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+                .ab-list-meta { font-size: 10px; color: #888; }
+                .ab-btn { background: #007acc; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+                .ab-btn:disabled { opacity: 0.5; cursor: default; }
+                .ab-textarea { width: 100%; height: 100px; background: #111; color: #eee; border: 1px solid #444; font-family: monospace; font-size: 11px; resize: vertical; }
+                .hidden { display: none !important; }
+            `;
+            document.head.appendChild(style);
+
+            popup.innerHTML = `
+                <div class="ab-header">
+                    <h3 style="margin:0;font-size:14px;">Aurora AdBlock</h3>
+                    <label class="switch">
+                        <input type="checkbox" id="adblock-toggle" ${this.state.enabled ? 'checked' : ''}>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div class="ab-nav" style="display:flex;border-bottom:1px solid #444;">
+                    <button class="ab-tab-btn active" data-tab="dashboard">Dashboard</button>
+                    <button class="ab-tab-btn" data-tab="lists">Filter Lists</button>
+                    <button class="ab-tab-btn" data-tab="custom">My Filters</button>
+                </div>
+                <div class="ab-content" id="ab-content-dashboard">
+                    <div style="text-align:center;padding:20px;">
+                        <div style="font-size:32px;font-weight:bold;color:#007acc;" id="adblock-count">${this.state.blockedCount}</div>
+                        <div style="font-size:12px;color:#aaa;">Items Blocked</div>
+                        <div style="margin-top:16px;font-size:12px;" id="adblock-status-text">Protection is Active</div>
+                    </div>
+                </div>
+                <div class="ab-content hidden" id="ab-content-lists">
+                    <div style="margin-bottom:10px;">
+                        <button class="ab-btn" id="ab-update-all" style="width:100%;">Update All Lists</button>
+                    </div>
+                    <div id="ab-lists-container"></div>
+                </div>
+                <div class="ab-content hidden" id="ab-content-custom">
+                    <p style="font-size:11px;color:#aaa;margin-top:0;">Enter custom rules (e.g. <code>||example.com^</code>):</p>
+                    <textarea class="ab-textarea" id="ab-custom-rules">${this.state.customRules}</textarea>
+                    <button class="ab-btn" id="ab-save-custom" style="margin-top:8px;width:100%;">Save Rules</button>
+                </div>
+            `;
+            document.body.appendChild(popup);
+
+            this.setupPopupEvents(popup);
+            this.renderLists();
+        }
+
+        setupPopupEvents(popup) {
+            popup.querySelector('#adblock-toggle').onchange = (e) => {
+                this.state.enabled = e.target.checked;
+                this.updateStatusUI();
+                this.saveState();
+            };
+
+            popup.querySelectorAll('.ab-tab-btn').forEach(btn => {
+                btn.onclick = () => {
+                    popup.querySelectorAll('.ab-tab-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    popup.querySelectorAll('.ab-content').forEach(c => c.classList.add('hidden'));
+                    popup.querySelector(`#ab-content-${btn.dataset.tab}`).classList.remove('hidden');
+                };
+            });
+
+            popup.querySelector('#ab-save-custom').onclick = () => {
+                const text = popup.querySelector('#ab-custom-rules').value;
+                this.state.customRules = text;
+                this.rebuildRules();
+                this.saveState();
+                alert('Custom rules saved!');
+            };
+            
+            popup.querySelector('#ab-update-all').onclick = () => {
+                this.updateAllLists();
+            };
+
+            document.addEventListener('click', (e) => {
+                if (!popup.contains(e.target) && e.target.id !== 'adblock-btn') {
+                    popup.classList.add('hidden');
+                }
+            });
+        }
+
+        updateStatusUI() {
+            const statusText = document.getElementById('adblock-status-text');
+            const btn = document.getElementById('adblock-btn');
+            if (statusText) statusText.textContent = this.state.enabled ? 'Protection is Active' : 'Protection is Paused';
+            if (btn) btn.style.opacity = this.state.enabled ? '1' : '0.5';
+        }
+        
+        updateCountUI() {
+             const countEl = document.getElementById('adblock-count');
+             if (countEl) countEl.textContent = this.state.blockedCount;
+        }
+
+        renderLists() {
+            const container = document.getElementById('ab-lists-container');
+            if (!container) return;
+            container.innerHTML = '';
+
+            this.state.lists.forEach((list, index) => {
+                const div = document.createElement('div');
+                div.className = 'ab-list-item';
+                const lastUpdate = list.lastUpdated ? new Date(list.lastUpdated).toLocaleDateString() : 'Never';
+                const ruleCount = list.rules ? list.rules.length : 0;
+                
+                div.innerHTML = `
+                    <div class="ab-list-header">
+                        <span style="font-weight:bold;font-size:12px;">${list.title}</span>
+                        <label class="switch" style="transform:scale(0.8);">
+                            <input type="checkbox" class="list-toggle" data-index="${index}" ${list.enabled ? 'checked' : ''}>
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="ab-list-meta">
+                        Rules: ${ruleCount} | Updated: ${lastUpdate}
+                    </div>
+                    <div style="margin-top:4px;">
+                        <button class="ab-btn update-btn" data-index="${index}">Update Now</button>
+                    </div>
+                `;
+                container.appendChild(div);
+            });
+
+            container.querySelectorAll('.list-toggle').forEach(t => {
+                t.onchange = (e) => {
+                    this.state.lists[e.target.dataset.index].enabled = e.target.checked;
+                    this.rebuildRules();
+                    this.saveState();
+                };
+            });
+
+            container.querySelectorAll('.update-btn').forEach(b => {
+                b.onclick = (e) => this.fetchList(e.target.dataset.index, e.target);
+            });
+        }
+
+        async fetchList(index, btn, silent = false) {
+            const list = this.state.lists[index];
+            if (!list) return;
+
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = "Downloading...";
+            }
+
+            try {
+                const response = await fetch(list.url);
+                if (!response.ok) throw new Error("Fetch failed");
+                const text = await response.text();
+                
+                const lines = text.split('\n');
+                const rules = [];
+                let title = list.title;
+
+                lines.forEach(line => {
+                    line = line.trim();
+                    if (!line) return;
+                    if (line.startsWith('!')) {
+                        if (line.startsWith('! Title:')) title = line.substring(8).trim();
+                        return;
+                    }
+                    if (line.startsWith('[')) return;
+                    rules.push(line);
+                });
+
+                list.rules = rules;
+                list.title = title;
+                list.lastUpdated = Date.now();
+                
+                this.saveState();
+                if (!silent) {
+                    this.rebuildRules();
+                    this.renderLists();
+                    alert(`Updated ${list.title}: ${rules.length} rules loaded.`);
+                }
+            } catch (e) {
+                console.error("Update failed", e);
+                if (!silent) alert("Failed to update list: " + e.message);
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = "Update Now";
+                }
+            }
+        }
+        
+        async updateAllLists() {
+            const btn = document.getElementById('ab-update-all');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = "Updating All...";
+            }
+            
+            let updated = 0;
+            for (let i = 0; i < this.state.lists.length; i++) {
+                if (this.state.lists[i].enabled) {
+                    await this.fetchList(i, null, true);
+                    updated++;
+                }
+            }
+            
+            this.rebuildRules();
+            this.renderLists();
+            
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = "Update All Lists";
+            }
+            alert(`Updated ${updated} lists.`);
+        }
+
+        togglePopup() {
+            const popup = document.getElementById('adblock-popup');
+            const btn = document.getElementById('adblock-btn');
+            const rect = btn.getBoundingClientRect();
+            
+            popup.style.top = (rect.bottom + 10) + 'px';
+            popup.style.right = (window.innerWidth - rect.right) + 'px';
+            popup.classList.toggle('hidden');
+            
+            if (!popup.classList.contains('hidden')) {
+                document.getElementById('adblock-count').textContent = this.state.blockedCount;
+            }
+        }
+    }
+
+    new AdBlocker();
+})();

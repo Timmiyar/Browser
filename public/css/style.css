@@ -1,0 +1,12 @@
+/* ...existing code... */
+.tabs-container {
+    display: flex;
+    align-items: center;
+    /* ...existing code... */
+}
+
+.new-tab-btn {
+    margin-left: 5px;
+    /* ...existing code... */
+}
+/* ...existing code... */

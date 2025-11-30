@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>History</title>
+    <style>
+        body { font-family: sans-serif; background: #1e1e1e; color: white; padding: 20px; }
+        .history-item { padding: 10px; border-bottom: 1px solid #333; }
+        .history-item a { color: #4daafc; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h1>History</h1>
+    <div id="history-list"></div>
+    <script>
+        const list = document.getElementById('history-list');
+        const history = JSON.parse(localStorage.getItem('aurora_history') || '[]');
+        history.forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'history-item';
+            div.innerHTML = `<span>${item.time}</span> - <a href="#" onclick="window.parent.search('${item.url}')">${item.url}</a>`;
+            list.appendChild(div);
+        });
+    </script>
+</body>
+</html>
