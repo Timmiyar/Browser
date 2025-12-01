@@ -90,6 +90,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       get tabs() { return tabs; },
       get activeTabId() { return activeTabId; },
       get settings() { return settings; },
+      get connection() { return connection; },
       navigate,
       createTab,
       closeTab,
