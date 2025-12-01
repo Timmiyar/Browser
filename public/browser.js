@@ -1569,6 +1569,30 @@ function renderInstalledExtensions() {
   }
 }
 
+function toggleExtension(id, enabled) {
+  const ext = extensions.find(e => e.id === id);
+  if (!ext) return;
+  
+  ext.enabled = enabled;
+  saveExtensions();
+  
+  if (enabled) {
+    // Run the extension if enabled
+    runExtension(ext);
+  } else {
+    // Optionally, you can stop the extension's functionality here
+    // For example, if it registers any background tasks or listeners
+  }
+}
+
+function deleteExtension(id) {
+  if (!confirm("Are you sure you want to delete this extension?")) return;
+  
+  extensions = extensions.filter(e => e.id !== id);
+  saveExtensions();
+  renderExtensionsPage();
+}
+
 // MARK: Marketplace functions
 
 async function renderMarketplacePage() {
@@ -1632,7 +1656,7 @@ function renderMarketplaceItems(items, indexUrl) {
         <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
           <div>
             ${installed ? `<button class="settings-btn" disabled style="margin-right:8px;">Installed</button>` : ""}
-            <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.file || item.fileUrl || item.url || "")}">
+            <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}">
               ${installed ? (updateAvailable ? "Update" : "Reinstall") : "Install"}
             </button>
           </div>
@@ -1652,9 +1676,29 @@ function renderMarketplaceItems(items, indexUrl) {
         
         // Resolve relative URLs against index URL
         try {
-           fileUrl = new URL(fileUrl, indexUrl).href;
+           let baseUrl = indexUrl;
+           // Explicitly handle index.json removal as requested to get the base directory
+           if (baseUrl.toLowerCase().endsWith('/index.json')) {
+               baseUrl = baseUrl.substring(0, baseUrl.length - 'index.json'.length);
+           } else {
+               // Fallback to directory of URL if not ending in index.json
+               baseUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+           }
+
+           // Remove leading slash from fileUrl to make it relative to baseUrl
+           // e.g. /files/AdBlock.txt -> files/AdBlock.txt
+           const relativePath = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
+           
+           // Handle absolute URLs in fileUrl
+           if (fileUrl.startsWith('http://') || fileUrl.startsWith('https://')) {
+               // do nothing, it's absolute
+           } else {
+               fileUrl = new URL(relativePath, baseUrl).href;
+           }
+           
+           addConsoleMessage("info", `Downloading extension from: ${fileUrl}`);
         } catch(e) {
-           // keep original if fails
+           console.error("URL resolution error:", e);
         }
 
         btn.disabled = true;
@@ -1679,7 +1723,7 @@ function renderMarketplaceItems(items, indexUrl) {
 
 async function installMarketplaceUrl(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch extension file");
+  if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
   const content = await res.text();
   const { metadata, code } = parseExtensionFile(content);
 
