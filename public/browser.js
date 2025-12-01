@@ -117,16 +117,42 @@ document.addEventListener("DOMContentLoaded", async () => {
             }
         }
       },
-      toggleIncognito: (state) => {
+      toggleIncognito: async (state) => {
         if (typeof state === 'boolean') isIncognito = state;
         else isIncognito = !isIncognito;
+        
+        const toolbar = document.getElementById('extensions-toolbar');
+        const incognitoBtnId = 'incognito-toggle-btn';
         
         if (isIncognito) {
             document.body.classList.add('incognito-mode');
             addConsoleMessage("info", "Incognito Mode Enabled");
+            
+            // Hide other extension buttons
+            if (toolbar) {
+                Array.from(toolbar.children).forEach(child => {
+                    if (child.id !== incognitoBtnId) {
+                        child.style.display = 'none';
+                    }
+                });
+            }
+            
+            // Clear site data to start fresh
+            await clearSiteData();
+
         } else {
             document.body.classList.remove('incognito-mode');
             addConsoleMessage("info", "Incognito Mode Disabled");
+            
+            // Show other extension buttons
+            if (toolbar) {
+                Array.from(toolbar.children).forEach(child => {
+                    child.style.display = '';
+                });
+            }
+            
+            // Clear site data generated during session
+            await clearSiteData();
         }
         return isIncognito;
       },
@@ -1252,6 +1278,47 @@ function clearHistory() {
   }
 }
 
+async function clearSiteData() {
+  try {
+    // Clear Cookies
+    const cookies = document.cookie.split(";");
+    for (let i = 0; i < cookies.length; i++) {
+        const cookie = cookies[i];
+        const eqPos = cookie.indexOf("=");
+        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
+    }
+
+    // Clear Storage (preserving Aurora data)
+    localStorage.clear();
+    sessionStorage.clear();
+    
+    // Restore Aurora Data immediately
+    saveSettings();
+    saveBookmarksToStorage();
+    saveHistoryToStorage();
+    saveExtensions();
+
+    // Clear Caches (Service Workers)
+    if (window.caches) {
+        const keys = await window.caches.keys();
+        await Promise.all(keys.map(key => window.caches.delete(key)));
+    }
+
+    // Clear IndexedDB (if supported)
+    if (window.indexedDB && window.indexedDB.databases) {
+        const dbs = await window.indexedDB.databases();
+        for (const db of dbs) {
+            window.indexedDB.deleteDatabase(db.name);
+        }
+    }
+    
+    addConsoleMessage("info", "Site data cleared (Cookies, Storage, Cache)");
+  } catch (e) {
+    console.error("Failed to clear site data:", e);
+  }
+}
+
 // ==================== Settings ====================
 function loadSettings() {
   try {
@@ -1979,7 +2046,7 @@ function showStorageContent(type) {
               const parts = c.trim().split('=');
               const key = parts[0];
               const value = parts.slice(1).join('=');
-              html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
+                           html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
             });
           } else {
              html += `<tr><td colspan="2" style="padding: 4px;">No cookies found</td></tr>`;
