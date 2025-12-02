@@ -108,8 +108,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       get settings() { return settings; },
       get connection() { return connection; },
       get isIncognito() { return isIncognito; },
-      get connection() { return connection; },
-      get isIncognito() { return isIncognito; },
       navigate,
       createTab,
       closeTab,
@@ -1553,7 +1551,6 @@ function saveHistoryToStorage() {
 
 function addToHistory(url, title) {
   if (isIncognito) return;
-  if (isIncognito) return;
   // Don't add duplicates in a row
   if (history.length > 0 && history[0].url === url) return;
   
@@ -1613,47 +1610,6 @@ function clearHistory() {
     history = [];
     saveHistoryToStorage();
     renderHistoryPage();
-  }
-}
-
-async function clearSiteData() {
-  try {
-    // Clear Cookies
-    const cookies = document.cookie.split(";");
-    for (let i = 0; i < cookies.length; i++) {
-        const cookie = cookies[i];
-        const eqPos = cookie.indexOf("=");
-        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
-        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
-    }
-
-    // Clear Storage (preserving Aurora data)
-    localStorage.clear();
-    sessionStorage.clear();
-    
-    // Restore Aurora Data immediately
-    saveSettings();
-    saveBookmarksToStorage();
-    saveHistoryToStorage();
-    saveExtensions();
-
-    // Clear Caches (Service Workers)
-    if (window.caches) {
-        const keys = await window.caches.keys();
-        await Promise.all(keys.map(key => window.caches.delete(key)));
-    }
-
-    // Clear IndexedDB (if supported)
-    if (window.indexedDB && window.indexedDB.databases) {
-        const dbs = await window.indexedDB.databases();
-        for (const db of dbs) {
-            window.indexedDB.deleteDatabase(db.name);
-        }
-    }
-    
-    addConsoleMessage("info", "Site data cleared (Cookies, Storage, Cache)");
-  } catch (e) {
-    console.error("Failed to clear site data:", e);
   }
 }
 
@@ -2066,30 +2022,6 @@ function deleteExtension(id) {
   renderExtensionsPage();
 }
 
-function toggleExtension(id, enabled) {
-  const ext = extensions.find(e => e.id === id);
-  if (!ext) return;
-  
-  ext.enabled = enabled;
-  saveExtensions();
-  
-  if (enabled) {
-    // Run the extension if enabled
-    runExtension(ext);
-  } else {
-    // Optionally, you can stop the extension's functionality here
-    // For example, if it registers any background tasks or listeners
-  }
-}
-
-function deleteExtension(id) {
-  if (!confirm("Are you sure you want to delete this extension?")) return;
-  
-  extensions = extensions.filter(e => e.id !== id);
-  saveExtensions();
-  renderExtensionsPage();
-}
-
 // MARK: Marketplace functions
 
 async function renderMarketplacePage() {
@@ -2154,7 +2086,6 @@ function renderMarketplaceItems(items, indexUrl) {
           <div>
             ${installed ? `<button class="settings-btn" disabled style="margin-right:8px;">Installed</button>` : ""}
             <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}">
-            <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}">
               ${installed ? (updateAvailable ? "Update" : "Reinstall") : "Install"}
             </button>
           </div>
@@ -2195,29 +2126,7 @@ function renderMarketplaceItems(items, indexUrl) {
            }
            
            addConsoleMessage("info", `Downloading extension from: ${fileUrl}`);
-           let baseUrl = indexUrl;
-           // Explicitly handle index.json removal as requested to get the base directory
-           if (baseUrl.toLowerCase().endsWith('/index.json')) {
-               baseUrl = baseUrl.substring(0, baseUrl.length - 'index.json'.length);
-           } else {
-               // Fallback to directory of URL if not ending in index.json
-               baseUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
-           }
-
-           // Remove leading slash from fileUrl to make it relative to baseUrl
-           // e.g. /files/AdBlock.txt -> files/AdBlock.txt
-           const relativePath = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
-           
-           // Handle absolute URLs in fileUrl
-           if (fileUrl.startsWith('http://') || fileUrl.startsWith('https://')) {
-               // do nothing, it's absolute
-           } else {
-               fileUrl = new URL(relativePath, baseUrl).href;
-           }
-           
-           addConsoleMessage("info", `Downloading extension from: ${fileUrl}`);
         } catch(e) {
-           console.error("URL resolution error:", e);
            console.error("URL resolution error:", e);
         }
 
@@ -2243,7 +2152,6 @@ function renderMarketplaceItems(items, indexUrl) {
 
 async function installMarketplaceUrl(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
   if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
   const content = await res.text();
   const { metadata, code } = parseExtensionFile(content);
@@ -2497,7 +2405,6 @@ function showStorageContent(type) {
               const parts = c.trim().split('=');
               const key = parts[0];
               const value = parts.slice(1).join('=');
-                           html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
                            html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
             });
           } else {
