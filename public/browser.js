@@ -236,12 +236,10 @@ const OfflineManager = {
 document.addEventListener("DOMContentLoaded", async () => {
   try {
     initializeElements(); // Initialize elements first
-    initializeElements(); // Initialize elements first
     injectBuiltinThemes(); // Inject CSS for built-in themes
     loadSettings();
     loadBookmarks();
     loadHistory();
-    loadCustomThemes(); // Load custom themes
     loadCustomThemes(); // Load custom themes
     loadExtensions();
     applyTheme();
@@ -351,7 +349,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       registerTheme: (id, name, css) => {
         customThemes[id] = { name, css };
         saveCustomThemes();
-        saveCustomThemes();
         // Refresh selector if settings page is open
         if (elements.settingsPage && !elements.settingsPage.classList.contains("hidden")) {
             populateSettingsPage();
@@ -360,29 +357,6 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (settings.theme === id) {
             applyTheme();
         }
-      },
-      injectCSS: (tabId, css) => {
-        const tab = tabs.find(t => t.id === tabId);
-        if (tab && tab.frame) {
-            try {
-                const doc = tab.frame.contentDocument || tab.frame.contentWindow.document;
-                if (doc) {
-                    const style = doc.createElement('style');
-                    style.textContent = css;
-                    doc.head.appendChild(style);
-                }
-            } catch(e) {
-                console.warn("Failed to inject CSS:", e);
-            }
-        }
-      },
-      toggleIncognito: async (state) => {
-        if (typeof state === 'boolean') isIncognito = state;
-        else isIncognito = !isIncognito;
-        
-        const toolbar = document.getElementById('extensions-toolbar');
-        const incognitoBtnId = 'incognito-toggle-btn';
-        
       },
       injectCSS: (tabId, css) => {
         const tab = tabs.find(t => t.id === tabId);
@@ -524,7 +498,6 @@ document.addEventListener("DOMContentLoaded", async () => {
                 saveBookmarksToStorage();
                 saveHistoryToStorage();
                 saveExtensions();
-                saveCustomThemes();
                 saveCustomThemes();
                 
                 preIncognitoSnapshot = null;
@@ -1989,33 +1962,6 @@ function populateSettingsPage() {
     elements.themeSelect.value = current;
   }
 
-  
-  if (elements.themeSelect) {
-    // Save current selection
-    const current = settings.theme;
-    
-    elements.themeSelect.innerHTML = "";
-    
-    // Built-in themes
-    BUILTIN_THEMES.forEach(theme => {
-      const option = document.createElement("option");
-      option.value = theme.id;
-      option.textContent = theme.name;
-      elements.themeSelect.appendChild(option);
-    });
-    
-    // Custom themes
-    Object.keys(customThemes).forEach(id => {
-      const theme = customThemes[id];
-      const option = document.createElement("option");
-      option.value = id;
-      option.textContent = `${theme.name} (Custom)`;
-      elements.themeSelect.appendChild(option);
-    });
-    
-    elements.themeSelect.value = current;
-  }
-
   if (elements.showBookmarksBar) elements.showBookmarksBar.checked = settings.showBookmarksBar;
   if (elements.performanceMode) elements.performanceMode.checked = settings.performanceMode;
 }
@@ -2346,19 +2292,6 @@ function saveCustomThemes() {
   localStorage.setItem("aurora_custom_themes", JSON.stringify(customThemes));
 }
 
-function loadCustomThemes() {
-  try {
-    const saved = localStorage.getItem("aurora_custom_themes");
-    customThemes = saved ? JSON.parse(saved) : {};
-  } catch (e) {
-    customThemes = {};
-  }
-}
-
-function saveCustomThemes() {
-  localStorage.setItem("aurora_custom_themes", JSON.stringify(customThemes));
-}
-
 function applyTheme() {
   // Safely remove existing theme classes without clearing other classes (like perf-mode or incognito-mode)
   const classes = Array.from(document.body.classList);
@@ -2381,106 +2314,8 @@ function applyTheme() {
     document.head.appendChild(style);
   } else {
     // Built-in theme
-  // Remove custom theme style if exists
-  const customStyle = document.getElementById("aurora-custom-theme-style");
-  if (customStyle) customStyle.remove();
-
-  if (settings.theme === "dark") {
-    // Default, do nothing (or ensure no class)
-  } else if (customThemes[settings.theme]) {
-    // Apply custom theme
-    const theme = customThemes[settings.theme];
-    const style = document.createElement("style");
-    style.id = "aurora-custom-theme-style";
-    style.textContent = theme.css;
-    document.head.appendChild(style);
-  } else {
-    // Built-in theme
     document.body.classList.add(`${settings.theme}-theme`);
   }
-}
-
-function injectBuiltinThemes() {
-  const styleId = "aurora-builtin-themes";
-  if (document.getElementById(styleId)) return;
-
-  const style = document.createElement("style");
-  style.id = styleId;
-  style.textContent = `
-    /* Light Theme */
-    body.light-theme {
-      --bg-primary: #ffffff;
-      --bg-secondary: #f0f2f5;
-      --bg-tertiary: #e4e6eb;
-      --text-primary: #050505;
-      --text-secondary: #65676b;
-      --border-color: #ced0d4;
-      --accent-color: #1b74e4;
-      --hover-color: #e4e6eb;
-    }
-    
-    /* Midnight Blue */
-    body.midnight-theme {
-      --bg-primary: #0f172a;
-      --bg-secondary: #1e293b;
-      --bg-tertiary: #334155;
-      --text-primary: #f8fafc;
-      --text-secondary: #94a3b8;
-      --border-color: #334155;
-      --accent-color: #38bdf8;
-      --hover-color: #334155;
-    }
-
-    /* Forest Green */
-    body.forest-theme {
-      --bg-primary: #1a2f1a;
-      --bg-secondary: #2f4f2f;
-      --bg-tertiary: #3d5d3d;
-      --text-primary: #e0ffe0;
-      --text-secondary: #a0c0a0;
-      --border-color: #3d5d3d;
-      --accent-color: #4caf50;
-      --hover-color: #3d5d3d;
-    }
-
-    /* Sunset Orange */
-    body.sunset-theme {
-      --bg-primary: #2d1b1b;
-      --bg-secondary: #4a2c2c;
-      --bg-tertiary: #6d3d3d;
-      --text-primary: #ffecd1;
-      --text-secondary: #d1a0a0;
-      --border-color: #6d3d3d;
-      --accent-color: #ff7e5f;
-      --hover-color: #6d3d3d;
-    }
-
-    /* Deep Ocean */
-    body.ocean-theme {
-      --bg-primary: #001f3f;
-      --bg-secondary: #003366;
-      --bg-tertiary: #004080;
-      --text-primary: #d0e1f9;
-      --text-secondary: #8aa2c9;
-      --border-color: #004080;
-      --accent-color: #0074d9;
-      --hover-color: #004080;
-    }
-
-    /* Hacker Green */
-    body.hacker-theme {
-      --bg-primary: #000000;
-      --bg-secondary: #0d0d0d;
-      --bg-tertiary: #1a1a1a;
-      --text-primary: #00ff00;
-      --text-secondary: #00cc00;
-      --border-color: #003300;
-      --accent-color: #00ff00;
-      --hover-color: #003300;
-      font-family: 'Courier New', monospace;
-    }
-  `;
-  document.head.appendChild(style);
 }
 
 function injectBuiltinThemes() {
