@@ -45,11 +45,14 @@ let settings = { ...DEFAULT_SETTINGS };
 let connection = null;
 let scramjet = null;
 let devtoolsOpen = false;
+let isInspecting = false; // New state for inspect mode
+let devtoolsHeight = 300; // Default height
 let networkRequests = [];
 let consoleMessages = [];
 let currentExtensionTab = 'installed';
 let isIncognito = false;
 let preIncognitoSnapshot = null; // Store main session data
+let toolbarActions = {}; // Store extension toolbar icons
 
 // Extension hooks
 let requestInterceptors = [];
@@ -58,14 +61,186 @@ let tabLoadListeners = [];
 // ==================== DOM Elements ====================
 const elements = {};
 
+// ==================== Utilities ====================
+// Moved up to prevent initialization errors
+function escapeHtml(text) {
+  if (!text) return "";
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function extractTitle(url) {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hostname;
+  } catch (e) {
+    return url;
+  }
+}
+
+function extractFileName(url) {
+  if (!url) return "";
+  try {
+    const urlObj = new URL(url);
+    const path = urlObj.pathname;
+    const fileName = path.split("/").pop() || urlObj.hostname;
+    return fileName.length > 40 ? fileName.substring(0, 40) + "..." : fileName;
+  } catch (e) {
+    return String(url).substring(0, 40);
+  }
+}
+
+// ==================== Offline Manager ====================
+const OfflineManager = {
+    dbName: 'AuroraOfflineCache',
+    version: 1,
+    enabled: false, // Requires extension to enable
+    
+    enable() {
+        this.enabled = true;
+        addConsoleMessage("info", "Offline Manager enabled by extension.");
+    },
+    
+    disable() {
+        this.enabled = false;
+        addConsoleMessage("info", "Offline Manager disabled.");
+    },
+
+    async open() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve(request.result);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('pages')) {
+                    db.createObjectStore('pages', { keyPath: 'url' });
+                }
+            };
+        });
+    },
+
+    async savePage(url, title, content) {
+        if (!this.enabled) return false;
+        try {
+            const db = await this.open();
+            const tx = db.transaction('pages', 'readwrite');
+            const store = tx.objectStore('pages');
+            await new Promise((resolve, reject) => {
+                const req = store.put({
+                    url: url,
+                    title: title,
+                    content: content,
+                    timestamp: Date.now()
+                });
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+            addConsoleMessage("info", `Page saved for offline: ${url}`);
+            return true;
+        } catch (e) {
+            console.error("Offline save failed:", e);
+            addConsoleMessage("error", "Failed to save page offline.");
+            return false;
+        }
+    },
+
+    async getPage(url) {
+        if (!this.enabled) return null;
+        try {
+            const db = await this.open();
+            const tx = db.transaction('pages', 'readonly');
+            const store = tx.objectStore('pages');
+            return new Promise((resolve, reject) => {
+                const req = store.get(url);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return null;
+        }
+    },
+
+    async hasPage(url) {
+        if (!this.enabled) return false;
+        try {
+            const db = await this.open();
+            const tx = db.transaction('pages', 'readonly');
+            const store = tx.objectStore('pages');
+            return new Promise((resolve, reject) => {
+                const req = store.count(url);
+                req.onsuccess = () => resolve(req.result > 0);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return false;
+        }
+    },
+
+    async getAllPages() {
+        try {
+            const db = await this.open();
+            const tx = db.transaction('pages', 'readonly');
+            const store = tx.objectStore('pages');
+            return new Promise((resolve, reject) => {
+                const req = store.getAll();
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return [];
+        }
+    },
+
+    async deletePage(url) {
+        try {
+            const db = await this.open();
+            const tx = db.transaction('pages', 'readwrite');
+            const store = tx.objectStore('pages');
+            await new Promise((resolve, reject) => {
+                const req = store.delete(url);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    // Helper for extensions to download and save a URL directly
+    async downloadAndSave(url) {
+        if (!this.enabled) return false;
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Failed to fetch ${url}`);
+            const content = await res.text();
+            
+            // Try to extract title
+            let title = url;
+            const titleMatch = content.match(/<title>(.*?)<\/title>/i);
+            if (titleMatch && titleMatch[1]) {
+                title = titleMatch[1];
+            }
+            
+            return await this.savePage(url, title, content);
+        } catch (e) {
+            console.error("Offline download failed:", e);
+            return false;
+        }
+    }
+};
+
 // ==================== Initialization ====================
 document.addEventListener("DOMContentLoaded", async () => {
   try {
+    initializeElements(); // Initialize elements first
     injectBuiltinThemes(); // Inject CSS for built-in themes
-    initializeElements();
     loadSettings();
     loadBookmarks();
     loadHistory();
+    loadCustomThemes(); // Load custom themes
     loadExtensions();
     applyTheme();
     setupEventListeners();
@@ -108,8 +283,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       get settings() { return settings; },
       get connection() { return connection; },
       get isIncognito() { return isIncognito; },
-      get connection() { return connection; },
-      get isIncognito() { return isIncognito; },
       navigate,
       createTab,
       closeTab,
@@ -119,8 +292,63 @@ document.addEventListener("DOMContentLoaded", async () => {
       // New hooks
       onBeforeNavigate: (callback) => requestInterceptors.push(callback),
       onTabLoaded: (callback) => tabLoadListeners.push(callback),
+      
+      // UI Hooks
+      registerToolbarAction: (id, icon, onClick) => {
+          toolbarActions[id] = { icon, onClick };
+          renderToolbarActions();
+      },
+      
+      showPopup: (html) => {
+          // Remove existing popup
+          const existing = document.getElementById('aurora-ext-popup');
+          if (existing) existing.remove();
+          
+          const popup = document.createElement('div');
+          popup.id = 'aurora-ext-popup';
+          popup.style.cssText = `
+              position: absolute;
+              top: 50px;
+              right: 10px;
+              width: 320px;
+              max-height: 500px;
+              background: var(--bg-secondary);
+              border: 1px solid var(--border-color);
+              border-radius: 12px;
+              box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+              z-index: 10000;
+              overflow: hidden;
+              display: flex;
+              flex-direction: column;
+              animation: slideDown 0.2s ease-out;
+          `;
+          
+          // Add animation style if not exists
+          if (!document.getElementById('popup-anim-style')) {
+              const style = document.createElement('style');
+              style.id = 'popup-anim-style';
+              style.textContent = `@keyframes slideDown { from { opacity:0; transform:translateY(-10px); } to { opacity:1; transform:translateY(0); } }`;
+              document.head.appendChild(style);
+          }
+
+          // Close on click outside
+          const closeHandler = (e) => {
+              if (!popup.contains(e.target) && !e.target.closest('.ext-toolbar-btn')) {
+                  popup.remove();
+                  document.removeEventListener('click', closeHandler);
+              }
+          };
+          
+          // Delay adding listener to avoid immediate close
+          setTimeout(() => document.addEventListener('click', closeHandler), 100);
+          
+          popup.innerHTML = html;
+          document.body.appendChild(popup);
+      },
+
       registerTheme: (id, name, css) => {
         customThemes[id] = { name, css };
+        saveCustomThemes();
         // Refresh selector if settings page is open
         if (elements.settingsPage && !elements.settingsPage.classList.contains("hidden")) {
             populateSettingsPage();
@@ -129,6 +357,29 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (settings.theme === id) {
             applyTheme();
         }
+      },
+      injectCSS: (tabId, css) => {
+        const tab = tabs.find(t => t.id === tabId);
+        if (tab && tab.frame) {
+            try {
+                const doc = tab.frame.contentDocument || tab.frame.contentWindow.document;
+                if (doc) {
+                    const style = doc.createElement('style');
+                    style.textContent = css;
+                    doc.head.appendChild(style);
+                }
+            } catch(e) {
+                console.warn("Failed to inject CSS:", e);
+            }
+        }
+      },
+      toggleIncognito: async (state) => {
+        if (typeof state === 'boolean') isIncognito = state;
+        else isIncognito = !isIncognito;
+        
+        const toolbar = document.getElementById('extensions-toolbar');
+        const incognitoBtnId = 'incognito-toggle-btn';
+        
         if (isIncognito) {
             document.body.classList.add('incognito-mode');
             addConsoleMessage("info", "Incognito Mode Enabled");
@@ -150,16 +401,32 @@ document.addEventListener("DOMContentLoaded", async () => {
             };
 
             // 2. CLEAR SESSION DATA (Start fresh for Incognito)
-            // We only clear Cookies/LS/SS to preserve heavy data like IDB/Cache if desired, 
-            // but for true isolation we should clear cookies/storage.
+            // Preserve BareMux/Transport keys to avoid breaking the connection
+            const keysToPreserve = [];
+            for(let i=0; i<localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if(key && (key.startsWith('bare') || key.includes('transport') || key.includes('wisp'))) {
+                    keysToPreserve.push({key, val: localStorage.getItem(key)});
+                }
+            }
+
             localStorage.clear();
             sessionStorage.clear();
             
+            // Restore infrastructure keys
+            keysToPreserve.forEach(k => localStorage.setItem(k.key, k.val));
+            
             const cookies = document.cookie.split(";");
             for (let i = 0; i < cookies.length; i++) {
-                const cookie = cookies[i];
+                const cookie = cookies[i].trim();
                 const eqPos = cookie.indexOf("=");
                 const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+                
+                // Preserve infrastructure cookies (GitHub Codespaces, Cloudflare, etc.)
+                if (name.toLowerCase().match(/(github|codespace|auth|token|cf_|__host|__secure|wisp|epoxy|bare)/)) {
+                    continue;
+                }
+
                 document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
             }
             
@@ -168,6 +435,16 @@ document.addEventListener("DOMContentLoaded", async () => {
             saveBookmarksToStorage();
             saveHistoryToStorage();
             saveExtensions();
+            saveCustomThemes();
+
+            // DO NOT force re-register SW or re-configure transport if they are already working.
+            if (!navigator.serviceWorker.controller) {
+                 try { await registerSW(); } catch(e) {}
+            }
+            
+            if (!connection) {
+                await configureTransport();
+            }
 
         } else {
             document.body.classList.remove('incognito-mode');
@@ -185,9 +462,15 @@ document.addEventListener("DOMContentLoaded", async () => {
             sessionStorage.clear();
             const cookies = document.cookie.split(";");
             for (let i = 0; i < cookies.length; i++) {
-                const cookie = cookies[i];
+                const cookie = cookies[i].trim();
                 const eqPos = cookie.indexOf("=");
                 const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+
+                // Preserve infrastructure cookies here too
+                if (name.toLowerCase().match(/(github|codespace|auth|token|cf_|__host|__secure|wisp|epoxy|bare)/)) {
+                    continue;
+                }
+
                 document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
             }
 
@@ -211,15 +494,19 @@ document.addEventListener("DOMContentLoaded", async () => {
                     });
                 }
                 
-                // Re-save Aurora state to ensure any bookmarks/settings changed during incognito are kept
-                // (If you want strict incognito where settings revert, remove these lines)
                 saveSettings();
                 saveBookmarksToStorage();
                 saveHistoryToStorage();
                 saveExtensions();
+                saveCustomThemes();
                 
                 preIncognitoSnapshot = null;
                 addConsoleMessage("info", "Main session restored.");
+            }
+            
+            // Ensure transport is still good
+            if (!connection) {
+                await configureTransport();
             }
         }
         return isIncognito;
@@ -326,7 +613,31 @@ document.addEventListener("DOMContentLoaded", async () => {
         escapeHtml,
         extractTitle,
         extractFileName,
-        applyPerformanceMode
+        applyPerformanceMode,
+        
+        // Offline
+        OfflineManager,
+        saveCurrentPageForOffline: async () => {
+            if (!OfflineManager.enabled) {
+                alert("Offline mode is not enabled. Please install an Offline Manager extension.");
+                return;
+            }
+            const tab = tabs.find(t => t.id === activeTabId);
+            if (!tab || !tab.frame) return;
+            try {
+                // Attempt to grab content. Note: May fail if cross-origin restricted.
+                const doc = tab.frame.contentDocument;
+                if (doc) {
+                    const content = doc.documentElement.outerHTML;
+                    const success = await OfflineManager.savePage(tab.url, tab.title, content);
+                    if (success) alert("Page saved for offline reading!");
+                } else {
+                    alert("Cannot save this page (Access Denied to frame content).");
+                }
+            } catch (e) {
+                alert("Failed to save page: " + e.message);
+            }
+        }
       }
     };
 
@@ -355,6 +666,7 @@ function initializeElements() {
   
   // Toolbar
   elements.extensionsToolbar = document.getElementById("extensions-toolbar");
+  elements.extensionsBtn = document.getElementById("extensions-btn");
   elements.bookmarkBtn = document.getElementById("bookmark-btn");
   elements.devtoolsBtn = document.getElementById("devtools-btn");
   elements.settingsBtn = document.getElementById("settings-btn");
@@ -379,6 +691,12 @@ function initializeElements() {
   
   // DevTools
   elements.devtoolsPanel = document.getElementById("devtools-panel");
+  
+  // Initialize DevTools UI (Resize handle & Inspect button)
+  if (elements.devtoolsPanel) {
+      setupDevToolsUI();
+  }
+
   elements.closeDevtools = document.getElementById("close-devtools");
   elements.consoleOutput = document.getElementById("console-output");
   elements.consoleInput = document.getElementById("console-input");
@@ -410,8 +728,26 @@ function initializeElements() {
   
   // Settings controls
   elements.searchEngine = document.getElementById("search-engine");
-  elements.themeSelect = document.getElementById("theme-select");
+  elements.themeSelect = document.getElementById("theme");
   elements.showBookmarksBar = document.getElementById("show-bookmarks-bar");
+  
+  // Add Save Theme Button
+  if (elements.themeSelect && !document.getElementById("save-theme-btn")) {
+      const saveBtn = document.createElement("button");
+      saveBtn.id = "save-theme-btn";
+      saveBtn.className = "settings-btn primary";
+      saveBtn.textContent = "Save Theme";
+      saveBtn.style.marginTop = "10px";
+      saveBtn.onclick = () => {
+          settings.theme = elements.themeSelect.value;
+          saveSettings();
+          applyTheme();
+          const originalText = saveBtn.textContent;
+          saveBtn.textContent = "Saved!";
+          setTimeout(() => saveBtn.textContent = originalText, 1000);
+      };
+      elements.themeSelect.parentNode.appendChild(saveBtn);
+  }
   
   // Inject Performance Setting
   if (!document.getElementById("performance-mode") && elements.settingsPage) {
@@ -419,15 +755,32 @@ function initializeElements() {
       container.className = "settings-section";
       container.innerHTML = `
         <h3>Performance</h3>
-        <label class="setting-item">
-            <input type="checkbox" id="performance-mode">
-            <span>Enable Game / Focus Mode</span>
-        </label>
-        <p class="setting-desc">Significantly improves speed by disabling background logs, UI effects, and prioritizing game content. Recommended for gaming.</p>
+        <div class="setting-item" style="display: flex; justify-content: space-between; align-items: center; padding: 10px 0;">
+            <div style="flex: 1; padding-right: 20px;">
+                <span style="font-weight: 500; font-size: 15px;">Game / Focus Mode</span>
+                <p class="setting-desc" style="margin: 5px 0 0; font-size: 13px; opacity: 0.7; line-height: 1.4;">
+                    Maximizes browser speed by disabling animations, background logs, and extensions. Forces single-tab focus and optimizes rendering for games.
+                </p>
+            </div>
+            <label style="position: relative; display: inline-block; width: 50px; height: 24px;">
+                <input type="checkbox" id="performance-mode" style="opacity: 0; width: 0; height: 0;">
+                <span class="slider" style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--bg-tertiary); transition: .4s; border-radius: 34px;"></span>
+                <span class="slider-knob" style="position: absolute; content: ''; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%;"></span>
+            </label>
+            <style>
+                #performance-mode:checked + .slider { background-color: var(--accent-color); }
+                #performance-mode:checked + .slider .slider-knob { transform: translateX(26px); }
+            </style>
+        </div>
       `;
-      // Insert before the Danger Zone or at the end
+      
+      // Insert before the Danger Zone or About section
       const dangerZone = elements.settingsPage.querySelector(".danger-zone");
-      if (dangerZone) {
+      const aboutBox = elements.settingsPage.querySelector(".about-section"); // Assuming class name
+      
+      if (aboutBox) {
+          elements.settingsPage.insertBefore(container, aboutBox);
+      } else if (dangerZone) {
           elements.settingsPage.insertBefore(container, dangerZone);
       } else {
           elements.settingsPage.appendChild(container);
@@ -455,6 +808,7 @@ function setupEventListeners() {
   }
   
   // Toolbar
+  if (elements.extensionsBtn) elements.extensionsBtn.addEventListener("click", () => window.aurora.navigate("aurora://extensions"));
   if (elements.bookmarkBtn) elements.bookmarkBtn.addEventListener("click", toggleBookmarkDialog);
   if (elements.devtoolsBtn) elements.devtoolsBtn.addEventListener("click", toggleDevTools);
   if (elements.settingsBtn) elements.settingsBtn.addEventListener("click", () => window.aurora.navigate("aurora://settings"));
@@ -492,6 +846,7 @@ function setupEventListeners() {
       if (e.key === "Enter") executeConsoleCommand();
     });
   }
+
   const clearNetworkBtn = document.getElementById("clear-network");
   if (clearNetworkBtn) clearNetworkBtn.addEventListener("click", clearNetworkLog);
   
@@ -567,7 +922,7 @@ function setupEventListeners() {
     elements.performanceMode.addEventListener("change", () => {
         settings.performanceMode = elements.performanceMode.checked;
         saveSettings();
-        applyPerformanceMode();
+        applyPerformanceMode(true);
     });
   }
   
@@ -650,7 +1005,7 @@ function setupKeyboardShortcuts() {
   }, true);
 }
 
-function applyPerformanceMode() {
+function applyPerformanceMode(fromUserAction = false) {
   // Remove old styles
   const oldStyle = document.getElementById('perf-styles');
   if (oldStyle) oldStyle.remove();
@@ -669,7 +1024,9 @@ function applyPerformanceMode() {
               box-shadow: none !important;
               text-shadow: none !important;
               transition: none !important;
+              animation: none !important;
               border-radius: 0 !important;
+              scroll-behavior: auto !important;
           }
           /* Hide Tab Bar */
           body.perf-mode #tabs-container {
@@ -682,74 +1039,44 @@ function applyPerformanceMode() {
           /* Optimize Frame */
           body.perf-mode .browser-frame {
               transform: translateZ(0);
-              will-change: transform;
+              will-change: transform, opacity;
+              image-rendering: optimizeSpeed; /* Firefox */
+              image-rendering: pixelated; /* Chrome */
+              contain: strict;
+          }
+          /* Minimalist UI */
+          body.perf-mode .nav-btn, 
+          body.perf-mode #url-bar {
+              border: 1px solid #444 !important;
+              background: #111 !important;
+              color: #0f0 !important;
           }
       `;
       document.head.appendChild(style);
-
-      // 1. Enforce Single Tab
-      if (tabs.length > 1) {
-          const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
-          // Close others
-          tabs = [activeTab];
-          activeTabId = activeTab.id;
-          
-          // Remove other frames from DOM
-          const frames = document.querySelectorAll('.browser-frame');
-          frames.forEach(f => {
-              if (f.id !== 'frame-' + activeTab.id) f.remove();
-          });
-          
-          renderTabs();
-      }
       
-      // 2. Disable Extensions (Clear hooks)
-      requestInterceptors = [];
-      tabLoadListeners = [];
+      addConsoleMessage("info", "🚀 Performance Mode Enabled: Extensions disabled, UI simplified.");
       
-      // 3. Clear Logs
-      consoleMessages = [];
-      networkRequests = [];
-      renderConsoleOutput();
-      renderNetworkList();
-      
-      // 4. Slow polling
-      tabs.forEach(tab => {
-          if (tab.urlPollingInterval) {
-              clearInterval(tab.urlPollingInterval);
-              tab.urlPollingInterval = setInterval(() => {
-                  if (tab.frame) updateTabUrlFromFrame(tab.frame, tab);
-              }, 5000);
+      // Notify user about extensions ONLY if this was a user action (toggle)
+      // On startup, extensions are already disabled by runExtension check, so no need to reload.
+      if (fromUserAction && extensions.some(e => e.enabled)) {
+          const shouldReload = confirm("Performance Mode enabled. Extensions will be disabled. Reload now to apply changes?");
+          if (shouldReload) {
+              window.location.reload();
           }
-      });
-
-      // Force one message
-      consoleMessages.push({ type: "info", message: "Game Mode Active: Single tab, extensions disabled, UI optimized.", timestamp: Date.now() });
-      renderConsoleOutput();
+      }
 
   } else {
       document.body.classList.remove('perf-mode');
+      addConsoleMessage("info", "Performance Mode Disabled.");
       
-      // Restore polling
-      tabs.forEach(tab => {
-          if (tab.urlPollingInterval) {
-              clearInterval(tab.urlPollingInterval);
-              tab.urlPollingInterval = setInterval(() => {
-                  if (tab.frame) updateTabUrlFromFrame(tab.frame, tab);
-              }, 2000);
-          }
-      });
-      
-      // Restore extensions
-      requestInterceptors = [];
-      tabLoadListeners = [];
-      extensions.forEach(ext => {
-        if (ext.enabled) runExtension(ext);
-      });
-      
-      addConsoleMessage("info", "Game Mode Disabled.");
+      // Notify user to re-enable extensions
+      if (fromUserAction && extensions.some(e => e.enabled)) {
+           // We don't force reload here, but extensions won't start until reload if they were suppressed
+           addConsoleMessage("info", "Reload to re-enable extensions.");
+      }
   }
 }
+
 
 // ==================== Tab Management ====================
 function createTab(url = "aurora://home", title = "New Tab") {
@@ -832,6 +1159,19 @@ function activateTab(tabId) {
     } else {
       showInternalPage(page);
     }
+    
+    // Update history
+    if (tab.history[tab.historyIndex] !== tab.url) {
+      tab.history = tab.history.slice(0, tab.historyIndex + 1);
+      tab.history.push(tab.url);
+      tab.historyIndex = tab.history.length - 1;
+    }
+    
+    updateUrlBar(tab.url);
+    updateNavigationButtons();
+    renderTabs();
+    addToHistory(tab.url, tab.title);
+    return;
   } else if (tab.frame) {
     tab.frame.classList.add("active");
   }
@@ -878,7 +1218,7 @@ function renderTabs() {
 }
 
 // ==================== Navigation ====================
-function navigate(input, tabId = activeTabId) {
+function navigate(input, tabId = activeTabId, options = {}) {
   const tab = tabs.find(t => t.id === tabId);
   if (!tab) return;
   
@@ -891,7 +1231,7 @@ function navigate(input, tabId = activeTabId) {
     // Check if it maps to an external URL
     if (AURORA_PROTOCOL_MAPPINGS[page] && !AURORA_PROTOCOL_MAPPINGS[page].startsWith("aurora://")) {
       // Proxy the external URL but show aurora://
-      proxyNavigate(AURORA_PROTOCOL_MAPPINGS[page], tabId, url);
+      proxyNavigate(AURORA_PROTOCOL_MAPPINGS[page], tabId, url, options);
       return;
     } else {
       // Internal page
@@ -902,22 +1242,26 @@ function navigate(input, tabId = activeTabId) {
     }
     
     // Update history
-    if (tab.history[tab.historyIndex] !== url) {
-      tab.history = tab.history.slice(0, tab.historyIndex + 1);
-      tab.history.push(url);
-      tab.historyIndex = tab.history.length - 1;
+    if (options.history !== false) {
+      if (tab.history[tab.historyIndex] !== url) {
+        tab.history = tab.history.slice(0, tab.historyIndex + 1);
+        tab.history.push(url);
+        tab.historyIndex = tab.history.length - 1;
+      }
     }
     
     updateUrlBar(url);
     updateNavigationButtons();
     renderTabs();
-    addToHistory(url, tab.title);
+    if (options.history !== false) {
+      addToHistory(url, tab.title);
+    }
     return;
   }
   
   // Handle regular URLs
   url = parseUrl(url);
-  proxyNavigate(url, tabId);
+  proxyNavigate(url, tabId, null, options);
 }
 
 function parseUrl(input) {
@@ -938,7 +1282,7 @@ function parseUrl(input) {
   return settings.searchEngine.replace("%s", encodeURIComponent(input));
 }
 
-async function proxyNavigate(url, tabId = activeTabId, displayUrl = null) {
+async function proxyNavigate(url, tabId = activeTabId, displayUrl = null, options = {}) {
   const tab = tabs.find(t => t.id === tabId);
   if (!tab) return;
 
@@ -952,6 +1296,50 @@ async function proxyNavigate(url, tabId = activeTabId, displayUrl = null) {
           }
       } catch (e) {
           console.error("Interceptor error:", e);
+      }
+  }
+  
+  // OFFLINE MODE CHECK
+  if (!navigator.onLine && OfflineManager.enabled) {
+      addConsoleMessage("info", "Network offline, checking cache...");
+      const offlinePage = await OfflineManager.getPage(url);
+      
+      if (offlinePage) {
+          // Ensure frame exists
+          if (!tab.scramjetFrame && scramjet) {
+            tab.scramjetFrame = scramjet.createFrame();
+            tab.frame = tab.scramjetFrame.frame;
+            tab.frame.className = "browser-frame";
+            tab.frame.id = "frame-" + tab.id;
+            elements.frameContainer.appendChild(tab.frame);
+          }
+          
+          if (tab.frame) {
+              // Render offline content
+              tab.frame.removeAttribute('src');
+              tab.frame.srcdoc = offlinePage.content;
+              
+              tab.url = displayUrl || url;
+              tab.title = offlinePage.title + " (Offline)";
+              tab.favicon = "💾";
+              
+              if (tabId === activeTabId) {
+                tab.frame.classList.add("active");
+                updateUrlBar(tab.url);
+                updateNavigationButtons();
+              }
+              
+              // Hide internal pages
+              if (elements.homePage) elements.homePage.classList.add("hidden");
+              if (elements.frameContainer) elements.frameContainer.style.display = "";
+              
+              renderTabs();
+              addConsoleMessage("info", "Loaded page from offline cache.");
+              return;
+          }
+      } else {
+          // Fall through to try loading anyway, or show error
+          addConsoleMessage("warn", "Page not found in offline cache.");
       }
   }
   
@@ -1007,11 +1395,13 @@ async function proxyNavigate(url, tabId = activeTabId, displayUrl = null) {
   tab.favicon = "🌐"; // Default to globe, wait for load to get real icon
   
   // Update history
-  const historyUrl = displayUrl || url;
-  if (tab.history[tab.historyIndex] !== historyUrl) {
-    tab.history = tab.history.slice(0, tab.historyIndex + 1);
-    tab.history.push(historyUrl);
-    tab.historyIndex = tab.history.length - 1;
+  if (options.history !== false) {
+    const historyUrl = displayUrl || url;
+    if (tab.history[tab.historyIndex] !== historyUrl) {
+      tab.history = tab.history.slice(0, tab.historyIndex + 1);
+      tab.history.push(historyUrl);
+      tab.historyIndex = tab.history.length - 1;
+    }
   }
   
   if (tabId === activeTabId) {
@@ -1021,20 +1411,24 @@ async function proxyNavigate(url, tabId = activeTabId, displayUrl = null) {
   }
   
   renderTabs();
-  addToHistory(tab.url, tab.title);
+  if (options.history !== false) {
+    addToHistory(tab.url, tab.title);
+  }
   addNetworkRequest(url, "document");
 }
 
-async function configureTransport() {
+async function configureTransport(force = false) {
   if (!connection) return;
   
   try {
     const wispUrl = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/wisp/";
-    const currentTransport = await connection.getTransport();
     
-    if (currentTransport !== "/epoxy/index.mjs") {
-      await connection.setTransport("/epoxy/index.mjs", [{ wisp: wispUrl }]);
+    if (!force) {
+        const currentTransport = await connection.getTransport();
+        if (currentTransport === "/epoxy/index.mjs") return;
     }
+    
+    await connection.setTransport("/epoxy/index.mjs", [{ wisp: wispUrl }]);
   } catch (err) {
     console.error("Failed to configure transport:", err);
     addConsoleMessage("error", `Failed to configure transport: ${err.message}`);
@@ -1047,6 +1441,173 @@ function setupFrameListeners(frame, tab) {
       // Try to get the title from the loaded page
       const doc = frame.contentDocument || frame.contentWindow?.document;
       if (doc) {
+        // Inject Bot Evasion & Verification Bypass
+        try {
+            const script = doc.createElement('script');
+            script.textContent = `
+                (function() {
+                    try {
+                        // 1. Navigator Properties: Hide webdriver
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        
+                        // 2. Chrome Object
+                        if (!window.chrome) window.chrome = {};
+                        const chrome = window.chrome;
+
+                        const installProperty = (obj, prop, value) => {
+                            if (!obj.hasOwnProperty(prop)) {
+                                Object.defineProperty(obj, prop, {
+                                    value: value,
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true
+                                });
+                            }
+                        };
+
+                        installProperty(chrome, 'runtime', {
+                            connect: function() {},
+                            sendMessage: function() {},
+                            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            getManifest: function() { return { version: "1.0.0" }; },
+                            getURL: function(path) { return path; },
+                            onMessage: { addListener: function() {}, removeListener: function() {} },
+                            onConnect: { addListener: function() {}, removeListener: function() {} },
+                            onInstalled: { addListener: function() {}, removeListener: function() {} }
+                        });
+
+                        installProperty(chrome, 'loadTimes', function() {
+                            return {
+                                getLoadTime: () => Date.now() / 1000,
+                                getLoadEventEnd: () => Date.now() / 1000,
+                                getNavigationType: () => "Other",
+                                wasNpnNegotiated: true,
+                                npnNegotiatedProtocol: "h2",
+                                wasAlternateProtocolAvailable: false,
+                                connectionInfo: "h2"
+                            };
+                        });
+
+                        installProperty(chrome, 'csi', function() {
+                            return {
+                                pageT: Date.now() / 1000,
+                                onloadT: Date.now() / 1000,
+                                startE: Date.now() / 1000,
+                                tran: 15
+                            };
+                        });
+
+                        installProperty(chrome, 'app', {
+                            isInstalled: false,
+                            getDetails: function() { return null; },
+                            getIsInstalled: function() { return false; },
+                            installState: function() { return "not_installed"; },
+                            runningState: function() { return "cannot_run"; },
+                            InstallState: {
+                                DISABLED: "disabled",
+                                INSTALLED: "installed",
+                                NOT_INSTALLED: "not_installed"
+                            },
+                            RunningState: {
+                                CANNOT_RUN: "cannot_run",
+                                READY_TO_RUN: "ready_to_run",
+                                RUNNING: "running"
+                            }
+                        });
+
+                        installProperty(chrome, 'webstore', {
+                            onInstallStageChanged: { addListener: function() {}, removeListener: function() {} },
+                            onDownloadProgress: { addListener: function() {}, removeListener: function() {} },
+                            install: function() {}
+                        });
+                        
+                        // 3. Permissions API
+                        const originalQuery = navigator.permissions?.query;
+                        if (originalQuery) {
+                            navigator.permissions.query = function(parameters) {
+                                if (parameters.name === 'notifications') return Promise.resolve({ state: 'prompt' });
+                                return originalQuery.apply(this, arguments);
+                            };
+                        }
+                        
+                        // Fix Notification.permission as well
+                        if (window.Notification) {
+                            try {
+                                Object.defineProperty(Notification, 'permission', {
+                                    get: () => 'default'
+                                });
+                            } catch(e) {}
+                        }
+                        
+                        // 4. Plugins
+                        Object.defineProperty(navigator, 'plugins', { get: () => {
+                            const plugins = [
+                                { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                                { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                                { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                                { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                                { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format" }
+                            ];
+                            return plugins;
+                        }});
+                        
+                        // 5. Languages
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                        
+                        // 6. User-Agent
+                        const ua = navigator.userAgent;
+                        if (!ua.includes('Chrome')) {
+                            Object.defineProperty(navigator, 'userAgent', {
+                                get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                            });
+                        }
+                        
+                        // 10. Mouse Events
+                        document.addEventListener('mousemove', () => {}, { once: true, passive: true });
+                        
+                        // 11. Touch Support
+                        if (!('ontouchstart' in window)) window.ontouchstart = null;
+                        
+                        // 12. Connection API
+                        if (navigator.connection) {
+                            try { Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' }); } catch(e) {}
+                        }
+                        
+                        // 13. Battery API
+                        if (!navigator.getBattery) {
+                            navigator.getBattery = function() {
+                                return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 0.85 });
+                            };
+                        }
+                        
+                        // 14. Hardware Concurrency
+                        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                        
+                        // 15. Device Memory
+                        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                        
+                        // 16. Max Touch Points
+                        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                        
+                        // Extra: PostMessage protection
+                        if (window.parent !== window) {
+                            const originalPostMessage = window.postMessage;
+                            window.postMessage = function(message, targetOrigin, transfer) {
+                                try { return originalPostMessage.call(this, message, targetOrigin, transfer); } catch(e) {}
+                            };
+                        }
+                        
+                        console.debug('[Aurora] Bot evasion loaded');
+                    } catch(e) { console.error('[Aurora] Bot evasion error:', e); }
+                })();
+            `;
+            if (doc.head) doc.head.appendChild(script);
+            if (doc.documentElement) doc.documentElement.appendChild(script);
+        } catch (e) {
+            console.warn("Failed to inject bot evasion script:", e);
+        }
+
+
         if (doc.title) {
           tab.title = doc.title;
         }
@@ -1106,6 +1667,9 @@ function setupFrameListeners(frame, tab) {
 function updateTabUrlFromFrame(frame, tab) {
   if (!frame.contentWindow) return;
   
+  // Fix: Do not update URL from frame if we are currently on an internal page
+  if (tab.url.startsWith("aurora://")) return;
+
   try {
     let newUrl = null;
     
@@ -1135,11 +1699,31 @@ function updateTabUrlFromFrame(frame, tab) {
 
     // If URL changed
     if (newUrl !== tab.url) {
+      
+      // Try to update title for history
+      try {
+        if (frame.contentDocument && frame.contentDocument.title) {
+            tab.title = frame.contentDocument.title;
+        }
+      } catch(e) {}
+
+      // Fix: Update history stack for in-frame navigations
+      if (tab.history[tab.historyIndex] !== newUrl) {
+          // Branch history if we navigated away from the middle of the stack
+          tab.history = tab.history.slice(0, tab.historyIndex + 1);
+          tab.history.push(newUrl);
+          tab.historyIndex = tab.history.length - 1;
+          
+          // Add to global history
+          addToHistory(newUrl, tab.title);
+      }
+
       tab.url = newUrl;
       
       // Update UI if this is the active tab
       if (tab.id === activeTabId) {
         updateUrlBar(newUrl);
+        updateNavigationButtons(); // Update buttons as history changed
         
         // Update bookmark button state based on new URL
         const isBookmarked = bookmarks.some(b => b.url === newUrl);
@@ -1235,61 +1819,17 @@ function goForward() {
 }
 
 function navigateToHistoryEntry(tab, url) {
-  if (url.startsWith("aurora://")) {
-    const page = url.replace("aurora://", "");
-    if (AURORA_PROTOCOL_MAPPINGS[page] && !AURORA_PROTOCOL_MAPPINGS[page].startsWith("aurora://")) {
-      // Hide internal pages
-      if (elements.homePage) elements.homePage.classList.add("hidden");
-      if (elements.settingsPage) elements.settingsPage.classList.add("hidden");
-      if (elements.historyPage) elements.historyPage.classList.add("hidden");
-      if (elements.bookmarksPage) elements.bookmarksPage.classList.add("hidden");
-      if (elements.extensionsPage) elements.extensionsPage.classList.add("hidden");
-      
-      if (tab.scramjetFrame) {
-        tab.scramjetFrame.go(AURORA_PROTOCOL_MAPPINGS[page]);
-        if (tab.frame) tab.frame.classList.add("active");
-      }
-      tab.url = url;
-    } else {
-      tab.url = url;
-      showInternalPage(page);
-    }
-  } else {
-    // Hide internal pages
-    if (elements.homePage) elements.homePage.classList.add("hidden");
-    if (elements.settingsPage) elements.settingsPage.classList.add("hidden");
-    if (elements.historyPage) elements.historyPage.classList.add("hidden");
-    if (elements.bookmarksPage) elements.bookmarksPage.classList.add("hidden");
-    if (elements.extensionsPage) elements.extensionsPage.classList.add("hidden");
-    
-    if (tab.scramjetFrame) {
-      tab.scramjetFrame.go(url);
-      if (tab.frame) tab.frame.classList.add("active");
-    }
-    tab.url = url;
-  }
-  
-  updateUrlBar(url);
-  updateNavigationButtons();
-  renderTabs();
+  // Use the public navigate function so extensions can intercept it (e.g. Offline Mode)
+  // Pass history: false to prevent creating a new history entry
+  window.aurora.navigate(url, tab.id, { history: false });
 }
 
 function refresh() {
   const tab = tabs.find(t => t.id === activeTabId);
   if (!tab) return;
   
-  if (tab.url.startsWith("aurora://")) {
-    const page = tab.url.replace("aurora://", "");
-    if (AURORA_PROTOCOL_MAPPINGS[page] && !AURORA_PROTOCOL_MAPPINGS[page].startsWith("aurora://")) {
-      if (tab.scramjetFrame) {
-        tab.scramjetFrame.go(AURORA_PROTOCOL_MAPPINGS[page]);
-      }
-    } else {
-      showInternalPage(page);
-    }
-  } else if (tab.scramjetFrame) {
-    tab.scramjetFrame.go(tab.url);
-  }
+  // Use the public navigate function so extensions can intercept it
+  window.aurora.navigate(tab.url, tab.id, { history: false });
 }
 
 // ==================== Internal Pages ====================
@@ -1395,7 +1935,33 @@ async function handleRestart() {
 
 function populateSettingsPage() {
   if (elements.searchEngine) elements.searchEngine.value = settings.searchEngine;
-  if (elements.themeSelect) elements.themeSelect.value = settings.theme;
+  
+  if (elements.themeSelect) {
+    // Save current selection
+    const current = settings.theme;
+    
+    elements.themeSelect.innerHTML = "";
+    
+    // Built-in themes
+    BUILTIN_THEMES.forEach(theme => {
+      const option = document.createElement("option");
+      option.value = theme.id;
+      option.textContent = theme.name;
+      elements.themeSelect.appendChild(option);
+    });
+    
+    // Custom themes
+    Object.keys(customThemes).forEach(id => {
+      const theme = customThemes[id];
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = `${theme.name} (Custom)`;
+      elements.themeSelect.appendChild(option);
+    });
+    
+    elements.themeSelect.value = current;
+  }
+
   if (elements.showBookmarksBar) elements.showBookmarksBar.checked = settings.showBookmarksBar;
   if (elements.performanceMode) elements.performanceMode.checked = settings.performanceMode;
 }
@@ -1440,6 +2006,42 @@ function renderBookmarksBar() {
     });
     elements.bookmarksList.appendChild(item);
   });
+}
+
+function renderToolbarActions() {
+  if (!elements.extensionsToolbar) return;
+
+  // Clear ONLY dynamic actions created by this system
+  const existing = elements.extensionsToolbar.querySelectorAll('.ext-toolbar-btn');
+  existing.forEach(btn => btn.remove());
+
+  const actionIds = Object.keys(toolbarActions);
+
+  actionIds.forEach(id => {
+    const action = toolbarActions[id];
+    const btn = document.createElement('button');
+    btn.className = 'settings-btn ext-toolbar-btn';
+    btn.style.display = 'inline-flex';
+    btn.style.alignItems = 'center';
+    btn.style.justifyContent = 'center';
+    btn.style.padding = '6px';
+    btn.style.minWidth = '32px';
+    btn.style.height = '32px';
+    btn.style.marginLeft = '5px';
+    btn.style.cursor = 'pointer';
+    btn.innerHTML = action.icon;
+    btn.title = id;
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      action.onClick();
+    };
+    elements.extensionsToolbar.appendChild(btn);
+  });
+  
+  // Ensure toolbar is visible if we have actions
+  if (actionIds.length > 0 && !settings.performanceMode && !isIncognito) {
+      elements.extensionsToolbar.style.display = 'flex';
+  }
 }
 
 function renderBookmarksPage() {
@@ -1553,7 +2155,6 @@ function saveHistoryToStorage() {
 
 function addToHistory(url, title) {
   if (isIncognito) return;
-  if (isIncognito) return;
   // Don't add duplicates in a row
   if (history.length > 0 && history[0].url === url) return;
   
@@ -1621,50 +2222,15 @@ async function clearSiteData() {
     // Clear Cookies
     const cookies = document.cookie.split(";");
     for (let i = 0; i < cookies.length; i++) {
-        const cookie = cookies[i];
+        const cookie = cookies[i].trim();
         const eqPos = cookie.indexOf("=");
         const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
-        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
-    }
-
-    // Clear Storage (preserving Aurora data)
-    localStorage.clear();
-    sessionStorage.clear();
-    
-    // Restore Aurora Data immediately
-    saveSettings();
-    saveBookmarksToStorage();
-    saveHistoryToStorage();
-    saveExtensions();
-
-    // Clear Caches (Service Workers)
-    if (window.caches) {
-        const keys = await window.caches.keys();
-        await Promise.all(keys.map(key => window.caches.delete(key)));
-    }
-
-    // Clear IndexedDB (if supported)
-    if (window.indexedDB && window.indexedDB.databases) {
-        const dbs = await window.indexedDB.databases();
-        for (const db of dbs) {
-            window.indexedDB.deleteDatabase(db.name);
+        
+        // Preserve infrastructure cookies
+        if (name.toLowerCase().match(/(github|codespace|auth|token|cf_|__host|__secure|wisp|epoxy|bare)/)) {
+            continue;
         }
-    }
-    
-    addConsoleMessage("info", "Site data cleared (Cookies, Storage, Cache)");
-  } catch (e) {
-    console.error("Failed to clear site data:", e);
-  }
-}
 
-async function clearSiteData() {
-  try {
-    // Clear Cookies
-    const cookies = document.cookie.split(";");
-    for (let i = 0; i < cookies.length; i++) {
-        const cookie = cookies[i];
-        const eqPos = cookie.indexOf("=");
-        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
         document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
     }
 
@@ -1713,6 +2279,19 @@ function saveSettings() {
   localStorage.setItem("aurora_settings", JSON.stringify(settings));
 }
 
+function loadCustomThemes() {
+  try {
+    const saved = localStorage.getItem("aurora_custom_themes");
+    customThemes = saved ? JSON.parse(saved) : {};
+  } catch (e) {
+    customThemes = {};
+  }
+}
+
+function saveCustomThemes() {
+  localStorage.setItem("aurora_custom_themes", JSON.stringify(customThemes));
+}
+
 function applyTheme() {
   // Safely remove existing theme classes without clearing other classes (like perf-mode or incognito-mode)
   const classes = Array.from(document.body.classList);
@@ -1720,9 +2299,106 @@ function applyTheme() {
     if (c.endsWith('-theme')) document.body.classList.remove(c);
   });
 
-  if (settings.theme && settings.theme !== "dark") {
+  // Remove custom theme style if exists
+  const customStyle = document.getElementById("aurora-custom-theme-style");
+  if (customStyle) customStyle.remove();
+
+  if (settings.theme === "dark") {
+    // Default, do nothing (or ensure no class)
+  } else if (customThemes[settings.theme]) {
+    // Apply custom theme
+    const theme = customThemes[settings.theme];
+    const style = document.createElement("style");
+    style.id = "aurora-custom-theme-style";
+    style.textContent = theme.css;
+    document.head.appendChild(style);
+  } else {
+    // Built-in theme
     document.body.classList.add(`${settings.theme}-theme`);
   }
+}
+
+function injectBuiltinThemes() {
+  const styleId = "aurora-builtin-themes";
+  if (document.getElementById(styleId)) return;
+
+  const style = document.createElement("style");
+  style.id = styleId;
+  style.textContent = `
+    /* Light Theme */
+    body.light-theme {
+      --bg-primary: #ffffff;
+      --bg-secondary: #f0f2f5;
+      --bg-tertiary: #e4e6eb;
+      --text-primary: #050505;
+      --text-secondary: #65676b;
+      --border-color: #ced0d4;
+      --accent-color: #1b74e4;
+      --hover-color: #e4e6eb;
+    }
+    
+    /* Midnight Blue */
+    body.midnight-theme {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-tertiary: #334155;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --border-color: #334155;
+      --accent-color: #38bdf8;
+      --hover-color: #334155;
+    }
+
+    /* Forest Green */
+    body.forest-theme {
+      --bg-primary: #1a2f1a;
+      --bg-secondary: #2f4f2f;
+      --bg-tertiary: #3d5d3d;
+      --text-primary: #e0ffe0;
+      --text-secondary: #a0c0a0;
+      --border-color: #3d5d3d;
+      --accent-color: #4caf50;
+      --hover-color: #3d5d3d;
+    }
+
+    /* Sunset Orange */
+    body.sunset-theme {
+      --bg-primary: #2d1b1b;
+      --bg-secondary: #4a2c2c;
+      --bg-tertiary: #6d3d3d;
+      --text-primary: #ffecd1;
+      --text-secondary: #d1a0a0;
+      --border-color: #6d3d3d;
+      --accent-color: #ff7e5f;
+      --hover-color: #6d3d3d;
+    }
+
+    /* Deep Ocean */
+    body.ocean-theme {
+      --bg-primary: #001f3f;
+      --bg-secondary: #003366;
+      --bg-tertiary: #004080;
+      --text-primary: #d0e1f9;
+      --text-secondary: #8aa2c9;
+      --border-color: #004080;
+      --accent-color: #0074d9;
+      --hover-color: #004080;
+    }
+
+    /* Hacker Green */
+    body.hacker-theme {
+      --bg-primary: #000000;
+      --bg-secondary: #0d0d0d;
+      --bg-tertiary: #1a1a1a;
+      --text-primary: #00ff00;
+      --text-secondary: #00cc00;
+      --border-color: #003300;
+      --accent-color: #00ff00;
+      --hover-color: #003300;
+      font-family: 'Courier New', monospace;
+    }
+  `;
+  document.head.appendChild(style);
 }
 
 function updateBookmarksBarVisibility() {
@@ -1760,6 +2436,17 @@ async function installExtensionFromUrl() {
   const url = elements.extensionUrlInput.value.trim();
   if (!url) return;
 
+  // Security Warning
+  const warning = "⚠️ SECURITY WARNING ⚠️\n\n" +
+                  "You are about to install an extension from a URL.\n" +
+                  "Extensions can access all your data, including passwords and browsing history.\n" +
+                  "Only install extensions from sources you completely trust.\n\n" +
+                  "Do you want to proceed?";
+  
+  if (!confirm(warning)) {
+      return;
+  }
+
   try {
     if (elements.extensionInstall) {
       elements.extensionInstall.textContent = "Installing...";
@@ -1767,20 +2454,15 @@ async function installExtensionFromUrl() {
     }
 
     const response = await fetch(url);
-    if (!response.ok) throw new Error("Failed to fetch extension");
+    if (!response.ok) throw new Error(`Failed to fetch extension: ${response.statusText}`);
     const content = await response.text();
-
+    
     const { metadata, code } = parseExtensionFile(content);
     
     if (extensions.some(e => e.id === metadata.id)) {
       if (!confirm(`Extension "${metadata.name}" is already installed. Update it?`)) {
-        if (elements.extensionInstall) {
-          elements.extensionInstall.textContent = "Install";
-          elements.extensionInstall.disabled = false;
-        }
         return;
       }
-      // Remove old version
       extensions = extensions.filter(e => e.id !== metadata.id);
     }
 
@@ -1797,8 +2479,7 @@ async function installExtensionFromUrl() {
     saveExtensions();
     runExtension(extension);
     
-    if (elements.extensionDialogOverlay) elements.extensionDialogOverlay.classList.add("hidden");
-    if (elements.extensionUrlInput) elements.extensionUrlInput.value = "";
+    elements.extensionUrlInput.value = "";
     renderExtensionsPage();
     alert(`Extension "${metadata.name}" installed successfully!`);
 
@@ -1819,6 +2500,17 @@ async function installExtensionFromCode() {
   if (!codeContent) {
     alert("Please paste extension code first.");
     return;
+  }
+
+  // Security Warning
+  const warning = "⚠️ SECURITY WARNING ⚠️\n\n" +
+                  "You are about to install an extension from raw code.\n" +
+                  "Extensions can access all your data, including passwords and browsing history.\n" +
+                  "Only install extensions if you understand the code or trust the source.\n\n" +
+                  "Do you want to proceed?";
+  
+  if (!confirm(warning)) {
+      return;
   }
 
   try {
@@ -1847,7 +2539,7 @@ async function installExtensionFromCode() {
     
     elements.extensionCodeInput.value = "";
     renderExtensionsPage();
-    alert(`Extension "${metadata.name}" installed successfully!`);
+    alert(`Extension "${metadata.name}" installed successfully!\n\nPlease refresh the page to ensure it works correctly.`);
 
   } catch (e) {
     alert(`Error installing extension: ${e.message}`);
@@ -1876,6 +2568,8 @@ function parseExtensionFile(content) {
 function runExtension(ext) {
   if (settings.performanceMode) return; // Disable extensions in Game Mode
 
+  const startTime = performance.now();
+
   try {
     // Execute in global scope using a script tag to ensure access to window
     const script = document.createElement('script');
@@ -1891,10 +2585,82 @@ function runExtension(ext) {
     `;
     document.head.appendChild(script);
     script.remove();
+
+    const endTime = performance.now();
+    const duration = endTime - startTime;
+
+    if (duration > 50) {
+        console.warn(`Extension "${ext.metadata.name}" took ${duration.toFixed(2)}ms to initialize.`);
+        checkExtensionLag(ext.metadata.name, duration);
+    }
+
   } catch (e) {
     console.error(`Failed to run extension ${ext.metadata.name}:`, e);
   }
 }
+
+function checkExtensionLag(name, duration) {
+    if (duration > 200) { // Threshold for "Laggy"
+        const action = confirm(
+            `⚠️ Performance Alert ⚠️\n\n` +
+            `The extension "${name}" is slowing down the browser (took ${duration.toFixed(0)}ms to load).\n\n` +
+            `Do you want to disable it to improve performance?`
+        );
+        
+        if (action) {
+            const extIndex = extensions.findIndex(e => e.metadata.name === name);
+            if (extIndex !== -1) {
+                extensions[extIndex].enabled = false;
+                saveExtensions();
+                alert(`Extension "${name}" disabled. Please reload the page.`);
+                window.location.reload();
+            }
+        }
+    }
+}
+
+// Global Performance Monitor (FPS Checker)
+let lastFrameTime = performance.now();
+let frameCount = 0;
+let lowFpsCount = 0;
+
+function monitorPerformance() {
+    if (settings.performanceMode) return; // Don't monitor in perf mode (it's already optimized)
+
+    const now = performance.now();
+    const delta = now - lastFrameTime;
+    
+    if (delta >= 1000) {
+        const fps = frameCount;
+        frameCount = 0;
+        lastFrameTime = now;
+
+        if (fps < 20 && extensions.some(e => e.enabled)) {
+            lowFpsCount++;
+            if (lowFpsCount > 5) { // 5 seconds of low FPS
+                lowFpsCount = 0;
+                const action = confirm(
+                    "⚠️ High Lag Detected ⚠️\n\n" +
+                    "The browser is running slowly. This might be caused by extensions.\n\n" +
+                    "Do you want to enable 'Game / Performance Mode' to disable extensions and speed up?"
+                );
+                if (action) {
+                    settings.performanceMode = true;
+                    saveSettings();
+                    window.location.reload();
+                }
+            }
+        } else {
+            lowFpsCount = 0;
+        }
+    }
+    
+    frameCount++;
+    requestAnimationFrame(monitorPerformance);
+}
+
+// Start monitoring
+requestAnimationFrame(monitorPerformance);
 
 function renderExtensionsPage() {
   if (!elements.extensionsPage) return;
@@ -1902,17 +2668,43 @@ function renderExtensionsPage() {
   // Inject Tabs if missing
   let tabBar = document.getElementById('ext-tabs');
   if (!tabBar) {
+    // Create Header Container
+    const header = document.createElement('div');
+    header.id = 'extensions-header'; // ID for easy identification
+    header.style.display = 'flex';
+    header.style.alignItems = 'center';
+    header.style.justifyContent = 'space-between';
+    header.style.marginBottom = '20px';
+    header.style.paddingBottom = '15px';
+    header.style.borderBottom = '1px solid var(--border-color)';
+
+    const title = document.createElement('h2');
+    title.textContent = 'Extensions';
+    title.style.margin = '0';
+    header.appendChild(title);
+
     tabBar = document.createElement('div');
     tabBar.id = 'ext-tabs';
     tabBar.style.display = 'flex';
     tabBar.style.gap = '10px';
-    tabBar.style.marginBottom = '20px';
-    tabBar.style.flexShrink = '0';
+    
+    header.appendChild(tabBar);
+    
+    // Insert header at top
+    if (elements.extensionsPage.firstChild) {
+        elements.extensionsPage.insertBefore(header, elements.extensionsPage.firstChild);
+    } else {
+        elements.extensionsPage.appendChild(header);
+    }
+
+    // Remove old h1 if exists
+    const oldH1 = elements.extensionsPage.querySelector('h1');
+    if (oldH1) oldH1.remove();
+
     tabBar.innerHTML = `
-      <button id="tab-installed-btn" class="settings-btn">Installed</button>
-      <button id="tab-marketplace-btn" class="settings-btn">Marketplace</button>
+      <button id="tab-installed-btn" class="settings-btn">My Extensions</button>
+      <button id="tab-marketplace-btn" class="settings-btn">Web Store</button>
     `;
-    elements.extensionsPage.insertBefore(tabBar, elements.extensionsPage.firstChild);
     
     document.getElementById('tab-installed-btn').onclick = () => { 
       currentExtensionTab = 'installed'; 
@@ -1928,12 +2720,14 @@ function renderExtensionsPage() {
   const btnInstalled = document.getElementById('tab-installed-btn');
   const btnMarketplace = document.getElementById('tab-marketplace-btn');
   if (btnInstalled) {
-      btnInstalled.style.background = currentExtensionTab === 'installed' ? 'var(--accent-color)' : 'var(--bg-secondary)';
-      btnInstalled.style.color = currentExtensionTab === 'installed' ? '#fff' : 'var(--text-primary)';
+      const activeStyle = 'background: var(--accent-color); color: #fff; border-color: var(--accent-color);';
+      const inactiveStyle = 'background: transparent; color: var(--text-primary); border-color: var(--border-color);';
+      btnInstalled.style.cssText = `padding: 8px 16px; border-radius: 20px; cursor: pointer; border: 1px solid; ${currentExtensionTab === 'installed' ? activeStyle : inactiveStyle}`;
   }
   if (btnMarketplace) {
-      btnMarketplace.style.background = currentExtensionTab === 'marketplace' ? 'var(--accent-color)' : 'var(--bg-secondary)';
-      btnMarketplace.style.color = currentExtensionTab === 'marketplace' ? '#fff' : 'var(--text-primary)';
+      const activeStyle = 'background: var(--accent-color); color: #fff; border-color: var(--accent-color);';
+      const inactiveStyle = 'background: transparent; color: var(--text-primary); border-color: var(--border-color);';
+      btnMarketplace.style.cssText = `padding: 8px 16px; border-radius: 20px; cursor: pointer; border: 1px solid; ${currentExtensionTab === 'marketplace' ? activeStyle : inactiveStyle}`;
   }
 
   // Ensure Lists Exist
@@ -1958,22 +2752,38 @@ function renderExtensionsPage() {
       elements.extensionsPage.appendChild(elements.marketplaceList);
   }
 
-  // Toggle Visibility
-  elements.extensionsList.style.display = currentExtensionTab === 'installed' ? 'block' : 'none';
-  elements.marketplaceList.style.display = currentExtensionTab === 'marketplace' ? 'block' : 'none';
+  // Apply Grid Style to Marketplace List
+  elements.marketplaceList.style.gridTemplateColumns = 'repeat(auto-fill, minmax(280px, 1fr))';
+  elements.marketplaceList.style.gap = '20px';
+  elements.marketplaceList.style.padding = '10px 0';
 
-  // Toggle Static Manual Install Controls
-  // We look for the elements by ID (static ones) and hide their container if found
-  const staticIds = ['extension-code-input', 'install-code-btn', 'extension-url-input', 'install-url-btn'];
-  staticIds.forEach(id => {
-      const el = document.getElementById(id);
-      if (el) {
-          // Find the closest settings-section or container that isn't the page itself
-          const container = el.closest('.settings-section');
-          if (container && container.parentElement === elements.extensionsPage) {
-              container.style.display = currentExtensionTab === 'installed' ? '' : 'none';
-          }
+  // Toggle Visibility
+  const header = document.getElementById('extensions-header');
+  
+  Array.from(elements.extensionsPage.children).forEach(child => {
+      // Always show header
+      if (child === header) {
+          child.style.display = 'flex';
+          return;
       }
+      
+      // Show Marketplace List only in marketplace tab
+      if (child === elements.marketplaceList) {
+          child.style.display = currentExtensionTab === 'marketplace' ? 'grid' : 'none';
+          return;
+      }
+      
+      // Show Extensions List only in installed tab
+      if (child === elements.extensionsList) {
+          child.style.display = currentExtensionTab === 'installed' ? 'block' : 'none';
+          return;
+      }
+      
+      // Hide everything else (manual install forms, etc) when in marketplace
+      // Show them when in installed tab
+      if (child.tagName === 'SCRIPT' || child.tagName === 'STYLE') return;
+      
+      child.style.display = currentExtensionTab === 'installed' ? '' : 'none';
   });
 
   // Render Content
@@ -2016,7 +2826,7 @@ function renderInstalledExtensions() {
         <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; font-size: 24px; background: var(--bg-tertiary); border-radius: 8px;">
           ${isImg ? `<img src="${icon}" style="width: 32px; height: 32px;">` : icon}
         </div>
-        <div style="flex: 1;">
+        <div style="flex: 1; min-width: 0;">
           <h3 style="margin: 0 0 4px 0; font-size: 16px;">${escapeHtml(ext.metadata.name)} <span style="font-size: 12px; color: var(--text-secondary);">v${escapeHtml(ext.metadata.version)}</span></h3>
           <p style="margin: 0; font-size: 13px; color: var(--text-secondary);">${escapeHtml(ext.metadata.description)}</p>
         </div>
@@ -2040,30 +2850,6 @@ function renderInstalledExtensions() {
       elements.extensionsList.appendChild(item);
     });
   }
-}
-
-function toggleExtension(id, enabled) {
-  const ext = extensions.find(e => e.id === id);
-  if (!ext) return;
-  
-  ext.enabled = enabled;
-  saveExtensions();
-  
-  if (enabled) {
-    // Run the extension if enabled
-    runExtension(ext);
-  } else {
-    // Optionally, you can stop the extension's functionality here
-    // For example, if it registers any background tasks or listeners
-  }
-}
-
-function deleteExtension(id) {
-  if (!confirm("Are you sure you want to delete this extension?")) return;
-  
-  extensions = extensions.filter(e => e.id !== id);
-  saveExtensions();
-  renderExtensionsPage();
 }
 
 function toggleExtension(id, enabled) {
@@ -2133,38 +2919,68 @@ function renderMarketplaceItems(items, indexUrl) {
   if (!elements.marketplaceList) return;
   elements.marketplaceList.innerHTML = "";
   if (!items || items.length === 0) {
+    elements.marketplaceList.style.display = 'block'; // Fallback to block for message
     elements.marketplaceList.innerHTML = '<p class="devtools-info">No extensions in marketplace.</p>';
     return;
   }
 
+  // Ensure grid layout
+  elements.marketplaceList.style.display = 'grid';
+
   items.forEach(item => {
     const container = document.createElement("div");
     container.className = "marketplace-item";
+    // Card styling
+    container.style.cssText = `
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+        transition: transform 0.2s, box-shadow 0.2s;
+        height: 100%;
+    `;
+    container.onmouseenter = () => {
+        container.style.transform = 'translateY(-2px)';
+        container.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+    };
+    container.onmouseleave = () => {
+        container.style.transform = 'none';
+        container.style.boxShadow = 'none';
+    };
+
     const installed = extensions.find(e => e.id === item.id);
     const updateAvailable = installed && compareVersions(item.version, installed.metadata.version) === 1;
 
     container.innerHTML = `
-      <div style="display:flex;align-items:center;gap:12px;padding:12px;border-bottom:1px solid var(--border-color);">
-        <div style="width:48px;height:48px;display:flex;align-items:center;justify-content:center;font-size:24px;">${item.icon||"🧩"}</div>
-        <div style="flex:1;">
-          <div style="font-weight:600">${escapeHtml(item.name)} <span style="font-size:12px;color:var(--text-secondary);">v${escapeHtml(item.version)}</span></div>
-          <div style="font-size:13px;color:var(--text-secondary);margin-top:4px;">${escapeHtml(item.description || "")}</div>
+      <div style="display:flex; align-items:center; gap:15px;">
+        <div style="width:56px; height:56px; display:flex; align-items: center; justify-content: center; font-size:32px; background: var(--bg-tertiary); border-radius: 12px;">
+            ${item.icon||"🧩"}
         </div>
-        <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
-          <div>
-            ${installed ? `<button class="settings-btn" disabled style="margin-right:8px;">Installed</button>` : ""}
-            <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}">
-            <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}">
-              ${installed ? (updateAvailable ? "Update" : "Reinstall") : "Install"}
-            </button>
-          </div>
-          ${installed && updateAvailable ? `<div style="color:var(--accent-color);font-size:12px;">Update available</div>` : ""}
+        <div style="flex:1; min-width:0;">
+            <div style="font-weight:700; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(item.name)}</div>
+            <div style="font-size:12px; color:var(--text-secondary);">v${escapeHtml(item.version)}</div>
         </div>
+      </div>
+      
+      <div style="font-size:13px; color:var(--text-secondary); flex:1; line-height:1.4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;">
+        ${escapeHtml(item.description || "No description available.")}
+      </div>
+      
+      <div style="margin-top:auto; display:flex; align-items: center; justify-content: space-between;">
+        ${installed && updateAvailable ? `<span style="color:var(--accent-color); font-size:12px; font-weight:bold;">Update Available</span>` : '<span></span>'}
+        
+        <button class="settings-btn marketplace-install" data-url="${escapeHtml(item.fileUrl || item.url || item.file || "")}" 
+            style="${installed && !updateAvailable ? 'background:var(--bg-tertiary); color:var(--text-secondary);' : 'background:var(--accent-color); color:#fff; border:none;'}">
+          ${installed ? (updateAvailable ? "Update" : "Installed") : "Add to Aurora"}
+        </button>
       </div>
     `;
 
     const btn = container.querySelector(".marketplace-install");
-    if (btn) {
+    if (btn && (!installed || updateAvailable)) {
       btn.addEventListener("click", async (e) => {
         let fileUrl = btn.dataset.url;
         if (!fileUrl) {
@@ -2195,134 +3011,338 @@ function renderMarketplaceItems(items, indexUrl) {
            }
            
            addConsoleMessage("info", `Downloading extension from: ${fileUrl}`);
-           let baseUrl = indexUrl;
-           // Explicitly handle index.json removal as requested to get the base directory
-           if (baseUrl.toLowerCase().endsWith('/index.json')) {
-               baseUrl = baseUrl.substring(0, baseUrl.length - 'index.json'.length);
-           } else {
-               // Fallback to directory of URL if not ending in index.json
-               baseUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
-           }
-
-           // Remove leading slash from fileUrl to make it relative to baseUrl
-           // e.g. /files/AdBlock.txt -> files/AdBlock.txt
-           const relativePath = fileUrl.startsWith('/') ? fileUrl.substring(1) : fileUrl;
-           
-           // Handle absolute URLs in fileUrl
-           if (fileUrl.startsWith('http://') || fileUrl.startsWith('https://')) {
-               // do nothing, it's absolute
-           } else {
-               fileUrl = new URL(relativePath, baseUrl).href;
-           }
-           
-           addConsoleMessage("info", `Downloading extension from: ${fileUrl}`);
         } catch(e) {
-           console.error("URL resolution error:", e);
            console.error("URL resolution error:", e);
         }
 
         btn.disabled = true;
-        btn.textContent = installed ? "Updating..." : "Installing...";
+        btn.textContent = installed ? "Updating..." : "Adding...";
         try {
           await installMarketplaceUrl(fileUrl);
           addConsoleMessage("info", `${item.name} installed/updated`);
           renderExtensionsPage(); // refresh installed list
           renderMarketplacePage(); // refresh marketplace status
+          alert(`Extension "${item.name}" installed successfully!\n\nPlease refresh the page to ensure it works correctly.`);
         } catch (err) {
-          addConsoleMessage("error", `Install failed: ${err.message || err}`);
-          alert(`Install failed: ${err.message || err}`);
+          addConsoleMessage("error", `Install failed: ${err.message}`);
+          alert(`Install failed: ${err.message}`);
           btn.disabled = false;
-          btn.textContent = installed ? "Update" : "Install";
+          btn.textContent = installed ? "Update" : "Add to Aurora";
         }
       });
+    } else if (btn) {
+        btn.disabled = true;
     }
 
     elements.marketplaceList.appendChild(container);
   });
 }
 
-async function installMarketplaceUrl(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
-  if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
-  const content = await res.text();
-  const { metadata, code } = parseExtensionFile(content);
-
-  if (extensions.some(e => e.id === metadata.id)) {
-    extensions = extensions.filter(e => e.id !== metadata.id);
+// ==================== DevTools ====================
+function setupDevToolsUI() {
+  const resizeHandle = document.getElementById("devtools-resize");
+  const inspectBtn = document.getElementById("inspect-btn");
+  
+  // Resize logic
+  if (resizeHandle) {
+    let isResizing = false;
+    let startY, startHeight;
+    
+    resizeHandle.addEventListener("mousedown", (e) => {
+      isResizing = true;
+      startY = e.clientY;
+      startHeight = elements.devtoolsPanel.offsetHeight;
+      document.body.style.cursor = "ns-resize";
+      if (elements.frameContainer) elements.frameContainer.style.pointerEvents = "none";
+    });
+    
+    document.addEventListener("mousemove", (e) => {
+      if (!isResizing) return;
+      const delta = startY - e.clientY;
+      const newHeight = Math.max(100, Math.min(window.innerHeight - 100, startHeight + delta));
+      elements.devtoolsPanel.style.height = newHeight + "px";
+      if (elements.mainContent) elements.mainContent.style.marginBottom = newHeight + "px";
+      devtoolsHeight = newHeight;
+    });
+    
+    document.addEventListener("mouseup", () => {
+      if (isResizing) {
+        isResizing = false;
+        document.body.style.cursor = "";
+        if (elements.frameContainer) elements.frameContainer.style.pointerEvents = "";
+      }
+    });
   }
-
-  const extension = {
-    id: metadata.id,
-    metadata: metadata,
-    code: code,
-    enabled: true,
-    sourceUrl: url,
-    installedAt: Date.now()
-  };
-
-  extensions.push(extension);
-  saveExtensions();
-  try { runExtension(extension); } catch (e) { console.error(e); }
-  renderExtensionsPage();
+  
+  // Inspect button
+  if (inspectBtn) {
+    inspectBtn.addEventListener("click", () => toggleInspectMode());
+  }
 }
 
-// ==================== DevTools ====================
+function toggleInspectMode(active) {
+  isInspecting = active !== undefined ? active : !isInspecting;
+  const inspectBtn = document.getElementById("inspect-btn");
+  
+  if (inspectBtn) {
+    inspectBtn.classList.toggle("active", isInspecting);
+  }
+  
+  if (isInspecting) {
+    addConsoleMessage("info", "Inspect mode active. Click to inspect.");
+    // Add overlay div to capture clicks over the iframe
+    let overlay = document.getElementById("inspect-overlay");
+    if (!overlay && elements.frameContainer) {
+        overlay = document.createElement("div");
+        overlay.id = "inspect-overlay";
+        overlay.style.cssText = "position:absolute; top:0; left:0; right:0; bottom:0; z-index:10000; cursor:crosshair;";
+        elements.frameContainer.appendChild(overlay);
+        
+        overlay.addEventListener("click", (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            toggleInspectMode(false);
+            toggleDevTools(true);
+            switchDevToolsTab("elements");
+            addConsoleMessage("info", "Opened Elements panel.");
+        });
+    }
+  } else {
+    const overlay = document.getElementById("inspect-overlay");
+    if (overlay) overlay.remove();
+  }
+}
+
 function toggleDevTools(show = null) {
   devtoolsOpen = show !== null ? show : !devtoolsOpen;
-  if (elements.devtoolsPanel) elements.devtoolsPanel.classList.toggle("hidden", !devtoolsOpen);
+  
+  // Ensure elements exist
+  if (!elements.devtoolsPanel) {
+      elements.devtoolsPanel = document.getElementById("devtools-panel");
+      if (!elements.devtoolsPanel) return; // Can't open if it doesn't exist
+  }
+
+  elements.devtoolsPanel.classList.toggle("hidden", !devtoolsOpen);
   
   if (devtoolsOpen) {
     // Adjust main content height
-    if (elements.mainContent) elements.mainContent.style.marginBottom = "300px";
-    renderDevToolsContent();
+    if (elements.mainContent) elements.mainContent.style.marginBottom = devtoolsHeight + "px";
+    elements.devtoolsPanel.style.height = devtoolsHeight + "px";
+    
+    // Determine which tab to show
+    let activeTab = document.querySelector(".devtools-tab.active");
+    let panelId = activeTab ? activeTab.dataset.panel : "elements";
+    
+    // Try to switch, if it fails, fallback to console
+    if (!switchDevToolsTab(panelId)) {
+        console.warn(`Failed to open panel ${panelId}, falling back to console`);
+        switchDevToolsTab("console");
+    }
   } else {
     if (elements.mainContent) elements.mainContent.style.marginBottom = "0";
   }
 }
 
-function switchDevToolsTab(panel) {
-  document.querySelectorAll(".devtools-tab").forEach(t => t.classList.remove("active"));
-  document.querySelectorAll(".devtools-pane").forEach(p => p.classList.remove("active"));
+function switchDevToolsTab(panelId) {
+  const panels = document.querySelectorAll(".devtools-panel");
+  let targetPanel = null;
+
+  // 1. Hide all panels
+  panels.forEach(panel => {
+    panel.style.display = "none";
+    panel.classList.remove("active");
+    
+    // Check if this is the one we want
+    if (panel.id === panelId || panel.id === `devtools-${panelId}`) {
+        targetPanel = panel;
+    }
+  });
   
-  const tab = document.querySelector(`.devtools-tab[data-panel="${panel}"]`);
-  if (tab) tab.classList.add("active");
-  const pane = document.getElementById(`devtools-${panel}`);
-  if (pane) pane.classList.add("active");
-  
-  renderDevToolsContent();
+  // 2. Show target panel
+  if (targetPanel) {
+    targetPanel.style.display = "block";
+    targetPanel.classList.add("active"); // CSS might rely on this
+
+    // 3. Render content
+    try {
+        if (panelId === "elements" || targetPanel.id.includes("elements")) {
+            renderDevToolsContent();
+        } else if (panelId === "console" || targetPanel.id.includes("console")) {
+            renderConsoleOutput();
+        } else if (panelId === "network" || targetPanel.id.includes("network")) {
+            renderNetworkList();
+        }
+    } catch (e) {
+        console.error("Error rendering devtools panel:", e);
+        targetPanel.innerHTML = `<div class="devtools-info error">Error rendering panel: ${e.message}</div>`;
+    }
+    
+    // 4. Update Tab UI
+    document.querySelectorAll(".devtools-tab").forEach(tab => {
+        if (tab.dataset.panel === panelId) tab.classList.add("active");
+        else tab.classList.remove("active");
+    });
+
+    return true;
+  } else {
+      console.warn(`DevTools panel '${panelId}' not found in DOM.`);
+      return false;
+  }
 }
 
 function renderDevToolsContent() {
   // Elements panel
   const domTree = document.getElementById("dom-tree");
-  if (!domTree) return;
+  if (!domTree) {
+      console.error("DevTools: #dom-tree not found");
+      return;
+  }
+  
+  // Clone to remove old listeners
+  const newDomTree = domTree.cloneNode(false);
+  newDomTree.id = "dom-tree"; // Critical: preserve ID
+  
+  // Safety check before replacing
+  if (domTree.parentNode) {
+      domTree.parentNode.replaceChild(newDomTree, domTree);
+  } else {
+      return; // Should not happen if getElementById worked
+  }
   
   const tab = tabs.find(t => t.id === activeTabId);
   
   if (tab && tab.frame) {
     try {
       // Accessing contentDocument should work for same-origin (proxied) frames
-      const doc = tab.frame.contentDocument || tab.frame.contentWindow.document;
-      if (doc) {
-        domTree.innerHTML = renderDomNode(doc.documentElement);
+      // Wrap in try-catch for cross-origin protection
+      let doc = null;
+      try {
+          // Try standard access
+          doc = tab.frame.contentDocument || (tab.frame.contentWindow ? tab.frame.contentWindow.document : null);
+      } catch(e) {
+          console.warn("DevTools: Cross-origin access blocked", e);
+      }
+
+      if (doc && doc.documentElement) {
+        // Render the tree
+        const html = renderDomNode(doc.documentElement);
+        if (html) {
+            newDomTree.innerHTML = html;
+        } else {
+            newDomTree.innerHTML = '<div class="devtools-info">Document is empty.</div>';
+        }
+        
+        // Add interaction
+        newDomTree.addEventListener('click', (e) => {
+            const nodeEl = e.target.closest('.dom-node');
+            if (nodeEl) {
+                newDomTree.querySelectorAll('.dom-node.selected').forEach(el => el.classList.remove('selected'));
+                nodeEl.classList.add('selected');
+            }
+        });
+        
+        // Add Edit on Double Click
+        newDomTree.addEventListener('dblclick', (e) => {
+            const nodeEl = e.target.closest('.dom-node');
+            if (nodeEl) {
+                const path = nodeEl.dataset.path;
+                editNodeHtml(doc.documentElement, path);
+            }
+        });
       } else {
-        domTree.innerHTML = '<p class="devtools-info">Document not available.</p>';
+        newDomTree.innerHTML = '<p class="devtools-info">Document not accessible (Cross-Origin Protected).</p>';
+        // Add a retry button
+        const retryBtn = document.createElement('button');
+        retryBtn.className = "devtools-btn";
+        retryBtn.textContent = "Retry / Force Refresh";
+        retryBtn.style.marginTop = "10px";
+        retryBtn.onclick = () => renderDevToolsContent();
+        newDomTree.appendChild(retryBtn);
       }
     } catch (e) {
-      domTree.innerHTML = `<p class="devtools-info">Cannot inspect frame content: ${e.message}</p>`;
+      newDomTree.innerHTML = `<p class="devtools-info">Cannot inspect frame content: ${e.message}</p>`;
     }
   } else {
-    domTree.innerHTML = '<p class="devtools-info">No page loaded.</p>';
+    newDomTree.innerHTML = '<p class="devtools-info">No page loaded.</p>';
   }
 }
 
-function renderDomNode(node, depth = 0) {
-  if (!node || depth > 5) return "";
+function getNodeFromPath(root, path) {
+    if (path === "root") return root;
+    const indices = path.replace("root,", "").split(",").map(Number);
+    let current = root;
+    for (const i of indices) {
+        // Use children to match renderDomNode logic
+        if (!current || !current.children || !current.children[i]) return null;
+        current = current.children[i];
+    }
+    return current;
+}
+
+function editNodeHtml(root, path) {
+    const node = getNodeFromPath(root, path);
+    if (!node) return;
+    
+    // Create a simple modal for editing
+    const currentHtml = node.outerHTML;
+    
+    // Create overlay
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.7); z-index: 20000;
+        display: flex; align-items: center; justify-content: center;
+    `;
+    
+    const modal = document.createElement('div');
+    modal.style.cssText = `
+        background: var(--bg-secondary); width: 600px; height: 400px;
+        border-radius: 8px; display: flex; flex-direction: column;
+        border: 1px solid var(--border-color); box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    `;
+    
+    const header = document.createElement('div');
+    header.style.cssText = "padding: 10px 15px; border-bottom: 1px solid var(--border-color); font-weight: bold; display: flex; justify-content: space-between; color: var(--text-primary);";
+    header.innerHTML = `<span>Edit HTML</span><span style="cursor:pointer;" id="close-edit">×</span>`;
+    
+    const textarea = document.createElement('textarea');
+    textarea.style.cssText = "flex: 1; background: var(--bg-primary); color: var(--text-primary); border: none; padding: 10px; font-family: monospace; resize: none; outline: none;";
+    textarea.value = currentHtml;
+    
+    const footer = document.createElement('div');
+    footer.style.cssText = "padding: 10px 15px; border-top: 1px solid var(--border-color); text-align: right;";
+    
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = "Save";
+    saveBtn.className = "settings-btn primary";
+    saveBtn.onclick = () => {
+        try {
+            node.outerHTML = textarea.value;
+            overlay.remove();
+            renderDevToolsContent(); // Refresh tree
+            addConsoleMessage("info", "HTML updated successfully.");
+        } catch(e) {
+            alert("Invalid HTML: " + e.message);
+        }
+    };
+    
+    footer.appendChild(saveBtn);
+    modal.appendChild(header);
+    modal.appendChild(textarea);
+    modal.appendChild(footer);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    
+    header.querySelector('#close-edit').onclick = () => overlay.remove();
+    overlay.onclick = (e) => { if(e.target === overlay) overlay.remove(); };
+}
+
+function renderDomNode(node, depth = 0, path = "root") {
+  if (!node || depth > 8) return "";
   
   if (node.nodeType === Node.TEXT_NODE) {
-    const text = node.textContent.trim();
-    if (text) return `<div class="dom-node">"${escapeHtml(text.substring(0, 50))}..."</div>`;
+    const text = node.textContent ? node.textContent.trim() : "";
+    if (text) return `<div class="dom-node text-node" data-path="${path}">"${escapeHtml(text.substring(0, 50))}..."</div>`;
     return "";
   }
   
@@ -2331,23 +3351,32 @@ function renderDomNode(node, depth = 0) {
   const tagName = node.tagName.toLowerCase();
   let attrs = "";
   
-  for (const attr of node.attributes) {
-    attrs += ` <span class="attr-name">${attr.name}</span>=<span class="attr-value">"${escapeHtml(attr.value.substring(0, 30))}"</span>`;
+  if (node.attributes) {
+      for (const attr of node.attributes) {
+        const val = attr.value || "";
+        attrs += ` <span class="attr-name">${attr.name}</span>=<span class="attr-value">"${escapeHtml(val.substring(0, 30))}"</span>`;
+      }
   }
   
-  let html = `<div class="dom-node"><span class="tag-name">&lt;${tagName}</span>${attrs}<span class="tag-name">&gt;</span>`;
+  let html = `<div class="dom-node element-node" data-path="${path}" style="padding-left: ${depth > 0 ? 10 : 0}px">
+    <span class="tag-string">&lt;<span class="tag-name">${tagName}</span>${attrs}&gt;</span>`;
   
-  if (node.children.length > 0 && depth < 3) {
-    html += '<div style="padding-left: 16px;">';
-    for (const child of node.children) {
-      html += renderDomNode(child, depth + 1);
+  if (node.children.length > 0) {
+    if (depth < 3) {
+        html += '<div class="children">';
+        for (let i = 0; i < node.children.length; i++) {
+            html += renderDomNode(node.children[i], depth + 1, path + "," + i);
+        }
+        html += '</div>';
+    } else {
+        html += `<span class="ellipsis">...</span>`;
     }
-    html += '</div>';
-  } else if (node.children.length > 0) {
-    html += '...';
+  } else {
+      const text = node.textContent.trim();
+      if (text) html += `<span class="text-content">${escapeHtml(text.substring(0, 50))}</span>`;
   }
   
-  html += `<span class="tag-name">&lt;/${tagName}&gt;</span></div>`;
+  html += `<span class="tag-string">&lt;/<span class="tag-name">${tagName}</span>&gt;</span></div>`;
   return html;
 }
 
@@ -2368,9 +3397,17 @@ function addConsoleMessage(type, message) {
 function renderConsoleOutput() {
   if (!elements.consoleOutput) return;
   
+  // Ensure container has proper styling to prevent layout breakage
+  if (!elements.consoleOutput.style.overflowY) {
+      elements.consoleOutput.style.overflowY = "auto";
+      elements.consoleOutput.style.height = "100%";
+      elements.consoleOutput.style.display = "flex";
+      elements.consoleOutput.style.flexDirection = "column";
+  }
+
   elements.consoleOutput.innerHTML = consoleMessages.map(msg => `
-    <div class="console-message ${msg.type}">
-      <span>${escapeHtml(msg.message)}</span>
+    <div class="console-message ${msg.type}" style="padding: 4px 8px; border-bottom: 1px solid var(--border-color); font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;">
+      <span>${escapeHtml(typeof msg.message === 'object' ? JSON.stringify(msg.message) : String(msg.message))}</span>
     </div>
   `).join("");
   
@@ -2464,47 +3501,69 @@ function showStorageContent(type) {
     const tab = tabs.find(t => t.id === activeTabId);
     
     if (tab && tab.frame) {
-      const win = tab.frame.contentWindow;
+      // Try to access contentWindow safely
+      let win;
+      try {
+          win = tab.frame.contentWindow;
+          // Access a property to trigger security check immediately
+          const test = win.location.href; 
+      } catch(e) {
+          throw new Error("Cross-origin frame access blocked.");
+      }
       
       if (type === "localStorage") {
         try {
+          // Check if storage is available
+          if (!win.localStorage) throw new Error("localStorage not available");
+          
           const storage = win.localStorage;
-          for (let i = 0; i < storage.length; i++) {
-            const key = storage.key(i);
-            const value = storage.getItem(key);
-            html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
+          if (storage.length === 0) {
+             html += `<tr><td colspan="2" style="padding: 4px; color: var(--text-secondary);">No items in localStorage</td></tr>`;
+          } else {
+              for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                const value = storage.getItem(key);
+                html += `<tr><td style="padding: 4px; font-weight:bold;">${escapeHtml(key)}</td><td style="padding: 4px; word-break:break-all;">${escapeHtml(value ? value.substring(0, 200) : "")}</td></tr>`;
+              }
           }
         } catch (e) {
-           html += `<tr><td colspan="2" style="padding: 4px;">Access denied to localStorage</td></tr>`;
+           html += `<tr><td colspan="2" style="padding: 4px; color: #ff6b6b;">Access denied to localStorage: ${e.message}</td></tr>`;
         }
       } else if (type === "sessionStorage") {
         try {
+          if (!win.sessionStorage) throw new Error("sessionStorage not available");
           const storage = win.sessionStorage;
-          for (let i = 0; i < storage.length; i++) {
-            const key = storage.key(i);
-            const value = storage.getItem(key);
-            html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
+          if (storage.length === 0) {
+             html += `<tr><td colspan="2" style="padding: 4px; color: var(--text-secondary);">No items in sessionStorage</td></tr>`;
+          } else {
+              for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                const value = storage.getItem(key);
+                html += `<tr><td style="padding: 4px; font-weight:bold;">${escapeHtml(key)}</td><td style="padding: 4px; word-break:break-all;">${escapeHtml(value ? value.substring(0, 200) : "")}</td></tr>`;
+              }
           }
         } catch (e) {
-           html += `<tr><td colspan="2" style="padding: 4px;">Access denied to sessionStorage</td></tr>`;
+           html += `<tr><td colspan="2" style="padding: 4px; color: #ff6b6b;">Access denied to sessionStorage: ${e.message}</td></tr>`;
         }
       } else if (type === "cookies") {
         try {
-          const cookieStr = win.document.cookie;
+          // Try accessing document.cookie
+          const doc = tab.frame.contentDocument || win.document;
+          const cookieStr = doc.cookie;
+          
           if (cookieStr) {
             const cookies = cookieStr.split(';');
             cookies.forEach(c => {
               const parts = c.trim().split('=');
               const key = parts[0];
               const value = parts.slice(1).join('=');
-                           html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
-                           html += `<tr><td style="padding: 4px;">${escapeHtml(key)}</td><td style="padding: 4px;">${escapeHtml(value.substring(0, 100))}</td></tr>`;
+              html += `<tr><td style="padding: 4px; font-weight:bold;">${escapeHtml(key)}</td><td style="padding: 4px; word-break:break-all;">${escapeHtml(value ? value.substring(0, 200) : "")}</td></tr>`;
             });
           } else {
-             html += `<tr><td colspan="2" style="padding: 4px;">No cookies found</td></tr>`;
+             html += `<tr><td colspan="2" style="padding: 4px; color: var(--text-secondary);">No cookies found</td></tr>`;
           }
         } catch (e) {
-           html += `<tr><td colspan="2" style="padding: 4px;">Access denied to cookies</td></tr>`;
+           html += `<tr><td colspan="2" style="padding: 4px; color: #ff6b6b;">Access denied to cookies: ${e.message}</td></tr>`;
         }
       }
     } else {
@@ -2522,134 +3581,145 @@ function showStorageContent(type) {
 function handleContextMenu(e) {
   e.preventDefault();
   
-  if (elements.contextMenu) {
-    elements.contextMenu.style.left = e.clientX + "px";
-    elements.contextMenu.style.top = e.clientY + "px";
-    elements.contextMenu.classList.remove("hidden");
+  const menu = document.getElementById("context-menu");
+  if (!menu) return;
+  
+  // Check for incognito extension
+  const incognitoItem = menu.querySelector('[data-action="incognito"]');
+  if (incognitoItem) {
+      const hasIncognito = extensions.some(e => 
+          e.enabled && (e.id === "incognito" || e.metadata.name.toLowerCase().includes("incognito"))
+      );
+      incognitoItem.style.display = hasIncognito ? "block" : "none";
   }
+
+  // Position menu
+  menu.style.left = `${e.clientX}px`;
+  menu.style.top = `${e.clientY}px`;
+  menu.classList.remove("hidden");
+  
+  // Add menu item actions
+  menu.querySelectorAll(".menu-item").forEach(item => {
+    item.onclick = () => handleMainMenuAction(item.dataset.action);
+  });
 }
 
 function toggleMainMenu() {
-  if (elements.mainMenu) elements.mainMenu.classList.toggle("hidden");
+  const menu = document.getElementById("main-menu");
+  if (menu) {
+    // Check for incognito extension
+    const incognitoItem = menu.querySelector('[data-action="file-incognito"]');
+    if (incognitoItem) {
+        const hasIncognito = extensions.some(e => 
+            e.enabled && (e.id === "incognito" || e.metadata.name.toLowerCase().includes("incognito"))
+        );
+        incognitoItem.style.display = hasIncognito ? "flex" : "none";
+    }
+
+    menu.classList.toggle("hidden");
+  }
 }
 
 function hideMenus() {
-  if (elements.contextMenu) elements.contextMenu.classList.add("hidden");
-  if (elements.mainMenu) elements.mainMenu.classList.add("hidden");
+  const menu = document.getElementById("main-menu");
+  if (menu) {
+    menu.classList.add("hidden");
+  }
+  
+  const contextMenu = document.getElementById("context-menu");
+  if (contextMenu) {
+    contextMenu.classList.add("hidden");
+  }
 }
 
 function handleContextMenuAction(action) {
-  hideMenus();
-  
-  switch (action) {
-    case "back":
-      goBack();
+  switch(action) {
+    case "reload":
+      window.aurora.refresh();
       break;
-    case "forward":
-      goForward();
+    case "close":
+      if (activeTabId) closeTab(activeTabId);
       break;
-    case "refresh":
-      refresh();
+    case "new_tab":
+      createTab("aurora://home", "New Tab");
       break;
-    case "view-source":
-      const tab = tabs.find(t => t.id === activeTabId);
-      if (tab && tab.frame) {
-        toggleDevTools(true);
-        switchDevToolsTab("sources");
-        try {
-          // Get current DOM state
-          const source = tab.frame.contentDocument.documentElement.outerHTML;
-          // Format slightly for readability
-          const sourceCode = document.getElementById("source-code");
-          if (sourceCode) sourceCode.textContent = source;
-        } catch (e) {
-          const sourceCode = document.getElementById("source-code");
-          if (sourceCode) sourceCode.textContent = "Cannot access source: " + e.message;
-        }
-      }
+    case "incognito":
+      window.aurora.toggleIncognito();
       break;
-    case "inspect":
-      toggleDevTools(true);
-      switchDevToolsTab("elements");
+    case "settings":
+      window.aurora.navigate("aurora://settings");
       break;
+    case "help":
+      window.aurora.navigate("https://example.com/help");
+      break;
+    default:
+      console.warn("Unknown context menu action:", action);
   }
 }
 
 function handleMainMenuAction(action) {
-  hideMenus();
-  
-  switch (action) {
-    case "new-tab":
+  switch(action) {
+    case "file-new":
       createTab("aurora://home", "New Tab");
       break;
-    case "new-window":
-      window.open(location.href, "_blank");
+    case "file-close":
+      if (activeTabId) closeTab(activeTabId);
       break;
-    case "history":
-      navigate("aurora://history");
+    case "file-incognito":
+      window.aurora.toggleIncognito();
       break;
-    case "bookmarks":
-      navigate("aurora://bookmarks");
+    case "edit-undo":
+      document.execCommand("undo");
       break;
-    case "extensions":
-      navigate("aurora://extensions");
+    case "edit-redo":
+      document.execCommand("redo");
       break;
-    case "downloads":
-      addConsoleMessage("info", "Downloads feature coming soon.");
+    case "view-reload":
+      window.aurora.refresh();
       break;
-    case "zoom-in":
-      document.body.style.zoom = (parseFloat(document.body.style.zoom) || 1) + 0.1;
+    case "view-home":
+      window.aurora.navigate("aurora://home");
       break;
-    case "zoom-out":
-      document.body.style.zoom = Math.max(0.5, (parseFloat(document.body.style.zoom) || 1) - 0.1);
+    case "settings":
+      window.aurora.navigate("aurora://settings");
       break;
-    case "zoom-reset":
-      document.body.style.zoom = 1;
-      break;
-    case "find":
-      addConsoleMessage("info", "Use Ctrl+F in the browser for find functionality.");
-      break;
-    case "print":
-      window.print();
+    case "help":
+      window.aurora.navigate("https://example.com/help");
       break;
     case "devtools":
       toggleDevTools();
       break;
-    case "settings":
-      navigate("aurora://settings");
-      break;
     case "about":
-      alert("Aurora Browser v1.0.0\n\nA sophisticated web proxy browser built on Scramjet technology.\n\nCopyright 2025 Firewall Freedom by Sirco");
+      alert("Aurora Browser v1.1.0\n\nA sophisticated web proxy browser built on Scramjet technology.\n\nCopyright 2025 Firewall Freedom by Sirco");
       break;
+    default:
+      console.warn("Unknown menu action:", action);
   }
 }
 
-// ==================== Utilities ====================
-function escapeHtml(text) {
-  if (!text) return "";
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
+async function installMarketplaceUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch extension file (${res.status})`);
+  const content = await res.text();
+  const { metadata, code } = parseExtensionFile(content);
 
-function extractTitle(url) {
-  try {
-    const urlObj = new URL(url);
-    return urlObj.hostname;
-  } catch (e) {
-    return url;
+  if (extensions.some(e => e.id === metadata.id)) {
+    extensions = extensions.filter(e => e.id !== metadata.id);
   }
-}
 
-function extractFileName(url) {
-  try {
-    const urlObj = new URL(url);
-    const path = urlObj.pathname;
-    const fileName = path.split("/").pop() || urlObj.hostname;
-    return fileName.length > 40 ? fileName.substring(0, 40) + "..." : fileName;
-  } catch (e) {
-    return url.substring(0, 40);
-  }
+  const extension = {
+    id: metadata.id,
+    metadata: metadata,
+    code: code,
+    enabled: true,
+    sourceUrl: url,
+    installedAt: Date.now()
+  };
+
+  extensions.push(extension);
+  saveExtensions();
+  try { runExtension(extension); } catch (e) { console.error(e); }
+  renderExtensionsPage();
 }
 
 // Ensure registerSW exists if not loaded from register-sw.js
